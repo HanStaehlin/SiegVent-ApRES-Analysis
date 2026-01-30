@@ -2,3 +2,41 @@
 .DS_Store
 mtm-asm_analysis/.Rapp.history
 data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Output and temporary files
+output/
+nohup.out
+*.log
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+
+# Large data files
+*.mat
+*.h5
+*.hdf5
+*.nc
+
+# External code
+xapres-master/
+fmcw_Catherine/
+
+# Figures (generated)
+figures/*.png
+figures/*.pdf
