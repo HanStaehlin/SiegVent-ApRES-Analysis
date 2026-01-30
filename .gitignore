@@ -37,6 +37,12 @@ nohup.out
 xapres-master/
 fmcw_Catherine/
 
+# Temporary/duplicate matlab files
+mainCode_simple.m
+
+# Docs (if not needed)
+docs/
+
 # Figures (generated)
 figures/*.png
 figures/*.pdf

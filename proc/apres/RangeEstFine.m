@@ -70,4 +70,6 @@ xlabel('Time [days]')
 
 %% Save data file
 range = Rcoarse(I)' + RfinePick';
-save('rangeOverTime','range','TimeInDays');
+timeInDays = TimeInDays;  % Match variable name convention
+save('rangeOverTime_matlab_new','range','timeInDays');
+disp('Saved: rangeOverTime_matlab_new.mat')
