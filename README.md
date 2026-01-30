@@ -3,6 +3,45 @@ Code repository for processing data and generating figures from Siegfried\*, Ven
 
 Data associated with this repository is [available on Zenodo](https://www.doi.org/10.5281/zenodo.7597019). See [running the notebooks](#running-the-notebooks) for instructions to programmatically download the dataset that will allow the code to run.
 
+## ApRES Internal Layer Velocity Analysis
+
+This repository includes a Python-based ApRES (Autonomous phase-sensitive Radio Echo Sounder) processing pipeline for analyzing internal ice layer velocities at Mercer Subglacial Lake.
+
+### Features
+
+- **Phase-based layer tracking** with robust unwrapping to handle λ/2 phase jumps
+- **Velocity estimation** from layer displacement over time with R² quality metrics
+- **Interactive Dash visualization** with 3D echogram viewer and layer analysis
+- **Sea surface tracking** at the ice-water interface (~1094m depth)
+- **Spline interpolation** of velocity profile from surface through layers to lake
+
+### Running the ApRES Visualization
+
+```bash
+# Set up environment
+mamba env create -f environment.yml -n siegvent2023
+mamba activate siegvent2023
+
+# Run the visualization app
+cd /path/to/SiegVent2023-Geology
+mamba run -n siegvent2023 python proc/apres/visualization_app.py \
+    --data data/apres/ImageP2_python.mat \
+    --output-dir output/apres/hybrid \
+    --port 8050
+
+# Open http://localhost:8050 in your browser
+```
+
+### ApRES Processing Scripts
+
+| Script | Description |
+|--------|-------------|
+| `proc/apres/visualization_app.py` | Interactive Dash app for layer analysis |
+| `proc/apres/phase_tracking.py` | Phase-based layer tracking with unwrapping |
+| `proc/apres/run_analysis.py` | Batch analysis runner |
+| `proc/apres/layer_detection.py` | Automatic layer detection algorithms |
+| `proc/apres/velocity_profile.py` | Velocity estimation from tracked layers |
+
 ## Running the notebooks: 
 
 1. Set up the environment: `conda env create -f environment.yml --name siegvent2023`
