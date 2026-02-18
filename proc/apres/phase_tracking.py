@@ -22,13 +22,15 @@ import json
 @dataclass
 class PhaseTrackingResult:
     """Container for phase tracking results."""
-    layer_depths: np.ndarray           # Depth of each layer (m)
+    layer_depths: np.ndarray           # Mean depth of each layer (m) - from detection
     phase_timeseries: np.ndarray       # Phase vs time [n_layers, n_times]
     range_timeseries: np.ndarray       # Fine range vs time [n_layers, n_times] (m)
     amplitude_timeseries: np.ndarray   # Amplitude vs time [n_layers, n_times]
     time_days: np.ndarray              # Time vector (days)
     n_layers: int
     lambdac: float                     # Center wavelength (m)
+    tracking_mode: Optional[np.ndarray] = None  # 1 = Phase, 0 = Speckle/Amplitude per layer
+    initial_depths: Optional[np.ndarray] = None  # Actual depth at t=0 for each layer (m)
 
 
 def correct_wrap_segments(
@@ -259,6 +261,7 @@ def load_layer_data(layer_path: str, apres_path: str) -> Tuple[dict, dict]:
         rfine = np.angle(raw_complex) * lambdac / (4 * np.pi)
         print("Using RawImageComplex for phase tracking")
     else:
+        raw_complex = None
         range_img = np.array(apres_data['RawImage'])
         rfine = np.array(apres_data['RfineBarTime'])
         print("Using RfineBarTime for phase tracking (RawImageComplex not available)")
@@ -266,6 +269,7 @@ def load_layer_data(layer_path: str, apres_path: str) -> Tuple[dict, dict]:
     data = {
         'range_img': range_img,
         'rfine': rfine,
+        'raw_complex': raw_complex,
         'Rcoarse': np.array(apres_data['Rcoarse']).flatten(),
         'time_days': np.array(apres_data['TimeInDays']).flatten(),
     }
@@ -274,28 +278,161 @@ def load_layer_data(layer_path: str, apres_path: str) -> Tuple[dict, dict]:
     return layers, data
 
 
-def track_layer_indices(
+def find_initial_depth_at_t0(
     range_img: np.ndarray,
-    start_idx: int,
-    search_window: Union[int, np.ndarray],
-) -> np.ndarray:
-    """Track layer bin indices using local peak tracking."""
+    rfine: np.ndarray,
+    Rcoarse: np.ndarray,
+    layer_idx: int,
+    search_window: int = 5,
+    use_phase: bool = True,
+    time_days: Optional[np.ndarray] = None,
+    avg_days: float = 50.0,
+) -> float:
+    """
+    Find the true initial depth of a layer using the median amplitude
+    over the first `avg_days` days for robust peak detection.
+    
+    Using the median of many measurements suppresses noise and gives
+    a much more reliable initial peak location than a single time step.
+    
+    Args:
+        range_img: Amplitude profiles [n_bins, n_times]
+        rfine: Fine range corrections [n_bins, n_times]
+        Rcoarse: Coarse range vector (m)
+        layer_idx: Expected bin index (from mean profile)
+        search_window: Window in bins to search for peak
+        use_phase: If True, include phase-based fine range
+        time_days: Time vector in days (for selecting averaging window)
+        avg_days: Number of days to average over for initial peak (default 50)
+        
+    Returns:
+        Initial depth (m)
+    """
     n_bins, n_times = range_img.shape
-    tracked_idx = np.zeros(n_times, dtype=int)
-    tracked_idx[0] = start_idx
+    bin_spacing = Rcoarse[1] - Rcoarse[0] if len(Rcoarse) > 1 else 0.25
+    
+    # Determine how many time steps fall within the first avg_days
+    if time_days is not None and len(time_days) > 1:
+        n_avg = int(np.searchsorted(time_days, time_days[0] + avg_days))
+        n_avg = max(1, min(n_avg, n_times))
+    else:
+        # Fallback: use first 10% of measurements
+        n_avg = max(1, n_times // 10)
+    
+    # Search for peak within window around expected position
+    lo = max(0, layer_idx - search_window)
+    hi = min(n_bins - 1, layer_idx + search_window)
+    
+    # Use MEDIAN amplitude of the first avg_days for robust peak detection
+    window_amp = np.median(np.abs(range_img[lo:hi + 1, :n_avg]), axis=1)
+    local_peak = int(np.argmax(window_amp))
+    peak_idx = lo + local_peak
+    
+    # Sub-bin parabolic interpolation on the median profile
+    subbin_offset = 0.0
+    if peak_idx > 0 and peak_idx < n_bins - 1:
+        y0 = window_amp[local_peak - 1] if local_peak > 0 else np.abs(range_img[peak_idx - 1, :n_avg]).mean()
+        y1 = window_amp[local_peak]
+        y2 = window_amp[local_peak + 1] if local_peak < len(window_amp) - 1 else np.abs(range_img[peak_idx + 1, :n_avg]).mean()
+        denom = y0 - 2 * y1 + y2
+        if abs(denom) > 1e-10:
+            subbin_offset = np.clip(0.5 * (y0 - y2) / denom, -0.5, 0.5)
+    
+    # Compute initial depth using median of first avg_days
+    coarse_range = Rcoarse[peak_idx]
+    subbin_correction = subbin_offset * bin_spacing
+    
+    if use_phase:
+        fine_range = np.median(rfine[peak_idx, :n_avg])
+        initial_depth = coarse_range + subbin_correction + fine_range
+    else:
+        initial_depth = coarse_range + subbin_correction
+    
+    return initial_depth
 
-    if isinstance(search_window, np.ndarray) and search_window.size != n_times:
-        raise ValueError("search_window array must match number of time steps")
 
-    for t in range(1, n_times):
-        prev_idx = tracked_idx[t - 1]
-        window = int(search_window[t]) if isinstance(search_window, np.ndarray) else int(search_window)
-        lo = max(0, prev_idx - window)
-        hi = min(n_bins - 1, prev_idx + window)
-        window = range_img[lo:hi + 1, t]
-        tracked_idx[t] = lo + int(np.argmax(window))
+def find_best_coherent_bin(
+    raw_complex: np.ndarray,
+    center_idx: int,
+    time_days: np.ndarray,
+    search_half_width: int = 5,
+    time_subsample: int = 5,
+    center_bias: float = 0.02,
+    lambdac: float = 0.5608,
+) -> Tuple[int, float]:
+    """
+    Search a neighborhood around center_idx for the bin with the best
+    phase stability that also yields a good velocity fit. This finds
+    the exact bin where a specular reflector sits, rather than relying
+    on the amplitude-peak bin which may not coincide with the most
+    phase-coherent scatterer.
 
-    return tracked_idx
+    Phase stability is defined as:  1 / (1 + var(detrended_phase))
+    A perfectly coherent reflector yields stability → 1.
+    Random phase noise gives stability → 0.
+
+    To avoid jumping to an entirely different reflector:
+    1. A center bias penalises bins further from center_idx:
+       score = stability - center_bias * |j - center_idx|
+    2. A candidate is only accepted if its velocity R² is at least as
+       high as the center bin's R² (no worsening the velocity fit).
+
+    Args:
+        raw_complex: Complex radar data [n_bins, n_times]
+        center_idx: Nominal bin index for this layer
+        time_days: Time vector (days) for velocity computation
+        search_half_width: Number of bins to search either side (default 5 ≈ ±0.26 m)
+        time_subsample: Subsample every Nth time step for speed (default 5)
+        center_bias: Stability penalty per bin of displacement from center (default 0.02)
+        lambdac: Center wavelength in ice (m), for velocity computation
+
+    Returns:
+        best_idx: Bin index with the highest biased phase stability
+        best_stability: The *raw* (unbiased) stability value at that bin
+    """
+    from scipy import stats as _stats
+
+    n_bins, n_times = raw_complex.shape
+    lo = max(0, center_idx - search_half_width)
+    hi = min(n_bins - 1, center_idx + search_half_width)
+
+    t_sub = np.arange(0, n_times, time_subsample)
+    n_sub = len(t_sub)
+    t_norm = np.arange(n_sub)
+
+    # Compute baseline R² at the center bin
+    ph_center = np.unwrap(np.angle(raw_complex[center_idx, :]))
+    disp_center = (ph_center - ph_center[0]) * lambdac / (4 * np.pi)
+    _, _, r_center, _, _ = _stats.linregress(time_days, disp_center)
+    r2_center = r_center ** 2
+
+    best_idx = center_idx
+    best_score = -np.inf
+    best_stability = -1.0
+
+    for j in range(lo, hi + 1):
+        ph = np.angle(raw_complex[j, t_sub])
+        ph_uw = np.unwrap(ph)
+        coeffs = np.polyfit(t_norm, ph_uw, 1)
+        ph_det = ph_uw - np.polyval(coeffs, t_norm)
+        stability = 1.0 / (1.0 + np.var(ph_det))
+        score = stability - center_bias * abs(j - center_idx)
+
+        if score > best_score:
+            # Check that this candidate doesn't worsen R²
+            if j != center_idx:
+                ph_full = np.unwrap(np.angle(raw_complex[j, :]))
+                disp_full = (ph_full - ph_full[0]) * lambdac / (4 * np.pi)
+                _, _, r_cand, _, _ = _stats.linregress(time_days, disp_full)
+                r2_cand = r_cand ** 2
+                if r2_cand < r2_center:
+                    continue  # Skip: would worsen velocity fit
+
+            best_score = score
+            best_stability = stability
+            best_idx = j
+
+    return best_idx, best_stability
 
 
 def extract_phase_at_layer(
@@ -303,50 +440,84 @@ def extract_phase_at_layer(
     rfine: np.ndarray,
     Rcoarse: np.ndarray,
     layer_idx: int,
-    search_window: Union[int, np.ndarray] = 3,
-    tracking_mode: str = "local_peak",
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    layer_snr: Optional[float] = None,
+    snr_threshold: float = 8.0,
+    raw_complex: Optional[np.ndarray] = None,
+    coherence_search_width: int = 0,
+    time_days: Optional[np.ndarray] = None,
+    lambdac: float = 0.5608,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
     """
-    Extract phase/fine-range time series at a specific layer.
-
-    Modes:
-    - "fixed": stay at detected bin, track fine range only (no bin shifts)
-    - "local_peak": follow the local amplitude peak within a small window
-      around the previous bin to allow slow layer drift without large jumps
+    Extract phase/fine-range time series at a specific layer using fixed-bin tracking.
+    
+    HYBRID METHOD:
+    - If layer_snr >= snr_threshold: Use phase for sub-millimeter precision
+    - If layer_snr < snr_threshold: Use only amplitude/speckle (no phase)
+    
+    If coherence_search_width > 0 and raw_complex is provided, search
+    ±coherence_search_width bins around layer_idx for the bin with the
+    best phase stability (coherence). This finds the exact specular 
+    reflector, which may not coincide with the amplitude peak bin.
+    The search will only shift to a neighboring bin if it has higher
+    stability AND does not worsen the velocity R².
 
     Args:
         range_img: Amplitude profiles [n_bins, n_times]
         rfine: Fine range corrections [n_bins, n_times]
         Rcoarse: Coarse range vector (m)
         layer_idx: Central bin index for this layer
-        search_window: Window in bins for local peak tracking (int or per-time array)
-        tracking_mode: "fixed" or "local_peak"
+        layer_snr: SNR of this layer in dB (for hybrid decision)
+        snr_threshold: Minimum SNR (dB) to use phase tracking
+        raw_complex: Complex radar data [n_bins, n_times] for coherence search
+        coherence_search_width: Search ±N bins for best coherence (0 = disabled)
+        time_days: Time vector (days) needed for R²-guarded coherence search
+        lambdac: Center wavelength in ice (m)
 
     Returns:
         total_range: Range time series (m)
         fine_range: Fine range time series (m)
         amplitude: Amplitude time series
         tracked_idx: Bin indices used at each time
+        used_phase: True if phase tracking was used, False if speckle-only
     """
     n_bins, n_times = range_img.shape
+    
+    # Hybrid decision: use phase only if SNR is sufficient
+    use_phase = True
+    if layer_snr is not None:
+        use_phase = layer_snr >= snr_threshold
 
-    if tracking_mode == "fixed":
-        fine_range = rfine[layer_idx, :].copy()
-        amplitude = range_img[layer_idx, :].copy()
-        tracked_idx = np.full(n_times, layer_idx, dtype=int)
-        total_range = fine_range.copy()
-        return total_range, fine_range, amplitude, tracked_idx
+    # Coherence search: find the most phase-stable bin in the neighborhood
+    actual_idx = layer_idx
+    if coherence_search_width > 0 and raw_complex is not None and use_phase:
+        if time_days is not None:
+            actual_idx, _ = find_best_coherent_bin(
+                raw_complex, layer_idx,
+                time_days=time_days,
+                search_half_width=coherence_search_width,
+                time_subsample=5,
+                lambdac=lambdac,
+            )
+        else:
+            # Fallback: stability-only search (no R² guard)
+            actual_idx, _ = find_best_coherent_bin(
+                raw_complex, layer_idx,
+                time_days=np.arange(n_times, dtype=float),
+                search_half_width=coherence_search_width,
+                time_subsample=5,
+                lambdac=lambdac,
+            )
 
-    if tracking_mode != "local_peak":
-        raise ValueError(f"Unknown tracking_mode: {tracking_mode}")
-
-    tracked_idx = track_layer_indices(range_img, layer_idx, search_window)
-    time_idx = np.arange(n_times)
-    fine_range = rfine[tracked_idx, time_idx]
-    amplitude = range_img[tracked_idx, time_idx]
-    total_range = Rcoarse[tracked_idx] + fine_range
-
-    return total_range, fine_range, amplitude, tracked_idx
+    # Fixed-bin tracking at the (possibly shifted) bin index
+    amplitude = range_img[actual_idx, :].copy()
+    tracked_idx = np.full(n_times, actual_idx, dtype=int)
+    if use_phase:
+        fine_range = rfine[actual_idx, :].copy()
+        total_range = Rcoarse[actual_idx] + fine_range
+    else:
+        fine_range = np.zeros(n_times)
+        total_range = np.full(n_times, Rcoarse[actual_idx])
+    return total_range, fine_range, amplitude, tracked_idx, use_phase
 
 
 def unwrap_range_timeseries(
@@ -507,11 +678,8 @@ def track_all_layers_smooth(
     layers: dict,
     data: dict,
     lambdac: float = 0.5608,
-    search_window_m: float = 1.0,
-    adaptive_window: bool = False,
-    max_search_window_m: Optional[float] = None,
+    search_window_m: float = 0.5,
     smooth_window: int = 11,
-    tracking_mode: str = "fixed",
     unwrap_mode: str = "min_step",
     max_step_m: float = 0.03,
     deriv_window: int = 21,
@@ -522,61 +690,64 @@ def track_all_layers_smooth(
     reject_jumps: bool = True,
     reject_sigma: float = 6.0,
     reject_floor_m: float = 0.08,
+    snr_threshold_db: float = 8.0,
+    speckle_smooth_window: int = 21,
+    coherence_search_width: int = 5,
 ) -> PhaseTrackingResult:
     """
     Track phase evolution for all detected layers with smooth interpolation.
     
-    Uses:
-    1. Fixed-bin or local-peak tracking (configurable)
+    HYBRID METHOD:
+    - High SNR layers (>= snr_threshold_db): Use phase tracking for sub-mm precision
+    - Low SNR layers (< snr_threshold_db): Use speckle/amplitude tracking only
+    
+    This prevents random walks in the Echo Free Zone (EFZ) where phase is incoherent.
+    
+    Uses fixed-bin tracking with:
+    1. Phase-based fine range for sub-wavelength precision (high SNR)
     2. Robust phase unwrapping with optional jump clamping
     3. Gentle median filtering to remove outliers
+    4. Initial peak found from median of first 50 days for robustness
+    5. Coherence-guided bin selection: search ±N bins for the most
+       phase-stable scatterer (if coherence_search_width > 0)
     
     Args:
-        layers: Layer detection results
-        data: ApRES data dictionary
+        layers: Layer detection results (must include 'snr' field)
+        data: ApRES data dictionary (must include 'raw_complex' for coherence search)
         lambdac: Center wavelength in ice (m)
-        search_window_m: Search window for peak tracking (m) - smaller is better
-        smooth_window: Median filter window (odd number)
+        search_window_m: Search window for initial peak detection (m)
+        smooth_window: Median filter window for phase tracking (odd number)
+        snr_threshold_db: Minimum SNR (dB) to use phase tracking (default 8.0)
+        speckle_smooth_window: Larger smoothing window for speckle tracking (default 21)
+        coherence_search_width: Search ±N bins for best phase coherence (default 5, 0 = disabled)
         
     Returns:
-        PhaseTrackingResult with all layer phase data
+        PhaseTrackingResult with all layer phase data and tracking_mode array
     """
     n_layers = layers['n_layers']
     n_times = len(data['time_days'])
     bin_spacing = data['Rcoarse'][1] - data['Rcoarse'][0]
     search_window = max(2, int(search_window_m / bin_spacing))
-    search_window_array: Union[int, np.ndarray] = search_window
-
-    if adaptive_window:
-        if max_search_window_m is None:
-            max_search_window_m = max(search_window_m * 2, search_window_m)
-        max_search_window = max(2, int(max_search_window_m / bin_spacing))
-        max_search_window = max(max_search_window, search_window)
-
-        time_days = data['time_days']
-        total_span = max(time_days[-1] - time_days[0], 1.0)
-        frac = (time_days - time_days[0]) / total_span
-        window_bins = search_window + (max_search_window - search_window) * frac
-        search_window_array = np.clip(np.rint(window_bins).astype(int), search_window, max_search_window)
-        if tracking_mode == "fixed":
-            tracking_mode = "local_peak"
     
     # Initialize arrays
     phase_ts = np.zeros((n_layers, n_times))
     range_ts = np.zeros((n_layers, n_times))
     amp_ts = np.zeros((n_layers, n_times))
+    tracking_mode_arr = np.zeros(n_layers, dtype=int)  # 1 = Phase, 0 = Speckle
+    initial_depths = np.zeros(n_layers)  # Actual depth at t=0 for each layer
     
     print(f"\nTracking {n_layers} layers through {n_times} time steps...")
-    print(f"  Sub-bin interpolation: parabolic")
-    if adaptive_window:
-        print(
-            f"  Search window: {search_window}–{int(np.max(search_window_array))} bins "
-            f"({search_window_m:.1f}–{max_search_window_m:.1f} m, adaptive)"
-        )
+    print(f"  HYBRID MODE: Phase for SNR >= {snr_threshold_db} dB, Speckle otherwise")
+    print(f"  Phase refinement: parabolic sub-bin + phase fine range")
+    print(f"  Search window: {search_window} bins ({search_window_m:.1f} m)")
+    print(f"  Initial peak: median of first 50 days")
+    print(f"  Tracking mode: fixed-bin")
+    if coherence_search_width > 0:
+        print(f"  Coherence search: ±{coherence_search_width} bins ({coherence_search_width * bin_spacing:.2f} m)")
     else:
-        print(f"  Search window: {search_window} bins ({search_window_m:.1f} m)")
-    print(f"  Smooth window: {smooth_window} points")
-    print(f"  Tracking mode: {tracking_mode}")
+        print(f"  Coherence search: disabled")
+    print(f"  Phase smooth window: {smooth_window} points")
+    print(f"  Speckle smooth window: {speckle_smooth_window} points")
     print(f"  Unwrap mode: {unwrap_mode}, max step: {max_step_m*100:.1f} cm")
     if unwrap_mode == "robust_derivative":
         print(f"  Derivative filter: window={deriv_window}, MAD×{deriv_mad_thresh}")
@@ -586,8 +757,15 @@ def track_all_layers_smooth(
     if reject_jumps:
         print(f"  Jump rejection: σ×{reject_sigma}, floor {reject_floor_m*100:.1f} cm")
     
+    n_phase = 0
+    n_speckle = 0
+    n_shifted = 0  # Count layers where coherence search moved the bin
+    raw_complex = data.get('raw_complex', None)
+    
     for i, layer_idx in enumerate(layers['indices']):
         layer_depth = layers['depths'][i]
+        layer_snr = layers['snr'][i] if 'snr' in layers else 100.0  # Default high SNR if not available
+        
         layer_reject_floor = reject_floor_m
         layer_reject_sigma = reject_sigma
         layer_hard_jump_m = hard_jump_m
@@ -597,89 +775,125 @@ def track_all_layers_smooth(
             layer_reject_sigma = min(layer_reject_sigma, 4.0)
             layer_hard_jump_m = min(layer_hard_jump_m, 0.005)
             layer_hard_jump_window = max(layer_hard_jump_window, 7)
-        # Extract range using parabolic interpolation
-        total_range, fine_range, amplitude, _ = extract_phase_at_layer(
+        
+        # Find TRUE initial depth using median of first 50 days for robustness
+        true_initial_depth = find_initial_depth_at_t0(
             data['range_img'],
             data['rfine'],
             data['Rcoarse'],
             layer_idx,
-            search_window_array,
-            tracking_mode,
+            search_window=search_window,
+            use_phase=True,
+            time_days=data['time_days'],
+            avg_days=50.0,
         )
+        initial_depths[i] = true_initial_depth
         
-        # Apply robust unwrapping with step clamp
-        range_change = unwrap_range_timeseries(
-            total_range,
+        # Extract range using HYBRID method (phase vs speckle based on SNR)
+        # With coherence search: find the most phase-stable bin in the neighborhood
+        total_range, fine_range, amplitude, tracked_idx_arr, used_phase = extract_phase_at_layer(
+            data['range_img'],
+            data['rfine'],
+            data['Rcoarse'],
+            layer_idx,
+            layer_snr=layer_snr,
+            snr_threshold=snr_threshold_db,
+            raw_complex=raw_complex,
+            coherence_search_width=coherence_search_width,
+            time_days=data['time_days'],
             lambdac=lambdac,
-            smooth_window=smooth_window,
-            mode=unwrap_mode,
-            max_step=max_step_m,
-            deriv_window=deriv_window,
-            deriv_mad_thresh=deriv_mad_thresh,
-            hard_jump_m=layer_hard_jump_m,
-            hard_jump_window=layer_hard_jump_window,
-            deriv_cap_m=deriv_cap_m,
-            reject_jumps=reject_jumps,
-            reject_sigma=layer_reject_sigma,
-            reject_floor_m=layer_reject_floor,
         )
+        actual_idx = tracked_idx_arr[0]
+        if actual_idx != layer_idx:
+            n_shifted += 1
+        
+        # Track which method was used
+        tracking_mode_arr[i] = 1 if used_phase else 0
+        
+        if used_phase:
+            # === HIGH SNR PIPELINE (PHASE) ===
+            # Apply robust unwrapping and phase corrections
+            n_phase += 1
+            
+            range_change = unwrap_range_timeseries(
+                total_range,
+                lambdac=lambdac,
+                smooth_window=smooth_window,
+                mode=unwrap_mode,
+                max_step=max_step_m,
+                deriv_window=deriv_window,
+                deriv_mad_thresh=deriv_mad_thresh,
+                hard_jump_m=layer_hard_jump_m,
+                hard_jump_window=layer_hard_jump_window,
+                deriv_cap_m=deriv_cap_m,
+                reject_jumps=reject_jumps,
+                reject_sigma=layer_reject_sigma,
+                reject_floor_m=layer_reject_floor,
+            )
 
-        range_change = correct_wrap_segments(
-            range_change,
-            data['time_days'],
-            wrap_period=lambdac / 2,
-            min_days=3.0,
-            max_days=5.0,
-            jump_m=0.15,
-            tolerance_m=0.12,
-            max_iters=10,
-        )
+            range_change = correct_wrap_segments(
+                range_change,
+                data['time_days'],
+                wrap_period=lambdac / 2,
+                min_days=3.0,
+                max_days=5.0,
+                jump_m=0.15,
+                tolerance_m=0.12,
+                max_iters=10,
+            )
 
-        range_change = correct_large_jumps(
-            range_change,
-            wrap_period=lambdac / 2,
-            jump_threshold=0.15,  # Lowered: any 15+ cm jump is suspicious
-            max_iters=10,
-        )
+            range_change = correct_large_jumps(
+                range_change,
+                wrap_period=lambdac / 2,
+                jump_threshold=0.15,
+                max_iters=10,
+            )
 
-        # Aggressively correct any remaining λ/2 jumps
-        range_change = correct_lambda2_jumps(
-            range_change,
-            wrap_period=lambdac / 2,
-            tolerance=0.05,  # 5 cm tolerance: 23-33 cm jumps are corrected
-            max_iters=20,
-        )
+            range_change = correct_lambda2_jumps(
+                range_change,
+                wrap_period=lambdac / 2,
+                tolerance=0.05,
+                max_iters=20,
+            )
 
-        # Correct cumulative drift if it's implausibly large
-        range_change = correct_cumulative_drift(
-            range_change,
-            wrap_period=lambdac / 2,
-            max_expected_drift_m=0.08,  # Expect < 8 cm total drift
-        )
+            range_change = correct_cumulative_drift(
+                range_change,
+                wrap_period=lambdac / 2,
+                max_expected_drift_m=0.08,
+            )
 
-        # Final pass: correct any jump > 20 cm within 5 days
-        # This is the most aggressive correction based on physical constraints
-        range_change = correct_windowed_jumps(
-            range_change,
-            data['time_days'],
-            wrap_period=lambdac / 2,
-            jump_threshold_m=0.20,  # 20 cm threshold as specified
-            window_days=5.0,        # 5 day window as specified
-            max_iters=50,
-        )
+            range_change = correct_windowed_jumps(
+                range_change,
+                data['time_days'],
+                wrap_period=lambdac / 2,
+                jump_threshold_m=0.20,
+                window_days=5.0,
+                max_iters=50,
+            )
 
-        # Note: Removed the extra loop that was using total_range to re-detect 
-        # wrap-like shifts, as it could undo the corrections from correct_windowed_jumps
-
-        if layer_depth >= 500:
-            head = range_change[:50]
-            tail = range_change[-50:]
-            if head.size >= 10 and tail.size >= 10:
-                head_med = np.nanmedian(head)
-                tail_med = np.nanmedian(tail)
-                offset = tail_med - head_med
-                if abs(abs(offset) - lambdac / 2) <= 0.06:
-                    range_change = range_change + np.sign(offset) * (lambdac / 2) * -1
+            if layer_depth >= 500:
+                head = range_change[:50]
+                tail = range_change[-50:]
+                if head.size >= 10 and tail.size >= 10:
+                    head_med = np.nanmedian(head)
+                    tail_med = np.nanmedian(tail)
+                    offset = tail_med - head_med
+                    if abs(abs(offset) - lambdac / 2) <= 0.06:
+                        range_change = range_change + np.sign(offset) * (lambdac / 2) * -1
+        else:
+            # === LOW SNR PIPELINE (SPECKLE/AMPLITUDE) ===
+            # Do NOT unwrap (speckle doesn't wrap like phase)
+            # Do NOT correct λ/2 jumps (speckle error is random, not quantized)
+            n_speckle += 1
+            
+            # Just calculate displacement relative to start
+            range_change = total_range - total_range[0]
+            
+            # Apply heavier smoothing for speckle (it's noisier than phase)
+            actual_speckle_window = max(speckle_smooth_window, smooth_window)
+            if actual_speckle_window % 2 == 0:
+                actual_speckle_window += 1
+            range_change = signal.medfilt(range_change, kernel_size=min(actual_speckle_window, len(range_change)))
         
         # Store results
         range_ts[i, :] = range_change
@@ -693,6 +907,12 @@ def track_all_layers_smooth(
         if (i + 1) % 10 == 0:
             print(f"  Processed {i+1}/{n_layers} layers")
     
+    print(f"\nHybrid tracking summary:")
+    print(f"  Phase-tracked (high SNR): {n_phase} layers")
+    print(f"  Speckle-tracked (low SNR): {n_speckle} layers")
+    if coherence_search_width > 0:
+        print(f"  Coherence search shifted bin for: {n_shifted}/{n_phase} phase-tracked layers")
+    
     result = PhaseTrackingResult(
         layer_depths=layers['depths'],
         phase_timeseries=phase_ts,
@@ -701,6 +921,8 @@ def track_all_layers_smooth(
         time_days=data['time_days'],
         n_layers=n_layers,
         lambdac=lambdac,
+        tracking_mode=tracking_mode_arr,
+        initial_depths=initial_depths,
     )
     
     print(f"Phase tracking complete!")
@@ -857,6 +1079,12 @@ def save_phase_results(result: PhaseTrackingResult, output_path: str) -> None:
         'n_layers': result.n_layers,
         'lambdac': result.lambdac,
     }
+    # Add tracking_mode if available (for hybrid tracking)
+    if result.tracking_mode is not None:
+        mat_data['tracking_mode'] = result.tracking_mode
+    # Add initial_depths if available (actual depth at t=0)
+    if result.initial_depths is not None:
+        mat_data['initial_depths'] = result.initial_depths
     savemat(f"{output_path}.mat", mat_data)
     print(f"Saved: {output_path}.mat")
 
