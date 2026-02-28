@@ -29,6 +29,8 @@ from pathlib import Path
 import json
 import base64
 import sys
+import gc
+import zarr
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -52,6 +54,17 @@ except Exception:
 # Cache for denoised echogram
 _denoised_cache = {}
 
+def fetch_zarr_slice(zarray, depth_mask, depth_step=1, time_step=1):
+    """Fetch a slice from a Zarr array using a contiguous 1D boolean mask."""
+    if zarray is None:
+        return None
+    idx = np.where(depth_mask)[0]
+    if len(idx) == 0:
+        return np.zeros((0, zarray.shape[1] // time_step), dtype=zarray.dtype)
+    i0, i1 = idx[0], idx[-1] + 1
+    return zarray[i0:i1:depth_step, ::time_step]
+
+
 
 def apply_fast_denoising(range_img: np.ndarray) -> np.ndarray:
     """
@@ -71,7 +84,7 @@ def apply_fast_denoising(range_img: np.ndarray) -> np.ndarray:
         Denoised echogram (same shape as input)
     """
     # Convert to dB for filtering (log-domain filtering works better)
-    img_db = 10 * np.log10(range_img**2 + 1e-30)
+    img_db = 10 * np.log10(np.asarray(range_img)**2 + 1e-30)
     
     # Apply median filter with horizontal emphasis (preserves layers)
     # Size is (depth, time) - larger in time dimension to smooth along layers
@@ -115,7 +128,79 @@ def load_denoised_echogram(output_dir: str, method: str = 'median') -> np.ndarra
     return None
 
 
-def get_denoised_echogram(apres_data: dict, output_dir: str = None, method: str = 'median') -> np.ndarray:
+def apply_svd_denoising(range_img, n_components: int = 50, block_size: int = 500) -> np.ndarray:
+    """
+    Apply SVD-based denoising to remove incoherent noise.
+    
+    SVD separates coherent signal (layers) from incoherent noise by
+    keeping only the top singular value components. Layers are coherent
+    across time, so they concentrate in the first components, while
+    incoherent noise spreads across many small components.
+    
+    Uses block processing to handle large matrices efficiently.
+    
+    Parameters
+    ----------
+    range_img : np.ndarray or zarr.Array
+        Original echogram (depth x time)
+    n_components : int
+        Number of SVD components to keep (more = less denoising)
+    block_size : int
+        Number of depth bins to process at once
+    
+    Returns
+    -------
+    np.ndarray
+        Denoised echogram (same shape as input)
+    """
+    range_img = np.asarray(range_img)
+    n_depth, n_time = range_img.shape
+    print(f"  SVD denoising: input shape {range_img.shape}, keeping {n_components} components")
+    
+    # Work in log domain for better dynamic range
+    img_db = 10 * np.log10(range_img**2 + 1e-30)
+    
+    # Center the data (important for SVD)
+    mean_profile = np.mean(img_db, axis=1, keepdims=True)
+    img_centered = img_db - mean_profile
+    
+    # Process in blocks to manage memory
+    n_blocks = (n_depth + block_size - 1) // block_size
+    denoised_db = np.zeros_like(img_db)
+    
+    for i in range(n_blocks):
+        start_idx = i * block_size
+        end_idx = min((i + 1) * block_size, n_depth)
+        block = img_centered[start_idx:end_idx, :]
+        
+        print(f"  Processing SVD block {i+1}/{n_blocks} (depths {start_idx}-{end_idx})...")
+        
+        try:
+            U, S, Vh = np.linalg.svd(block, full_matrices=False)
+            
+            # Keep only top n_components
+            n_keep = min(n_components, len(S))
+            S_filtered = np.zeros_like(S)
+            S_filtered[:n_keep] = S[:n_keep]
+            
+            # Reconstruct
+            block_denoised = U @ np.diag(S_filtered) @ Vh
+            denoised_db[start_idx:end_idx, :] = block_denoised + mean_profile[start_idx:end_idx]
+            
+        except np.linalg.LinAlgError as e:
+            print(f"  Warning: SVD failed for block {i+1}, using original: {e}")
+            denoised_db[start_idx:end_idx, :] = img_db[start_idx:end_idx, :]
+    
+    # Convert back from dB
+    denoised = np.sqrt(10 ** (denoised_db / 10))
+    
+    # Clip to reasonable range (SVD can produce artifacts)
+    denoised = np.clip(denoised, 0, np.max(range_img) * 1.1)
+    
+    return denoised
+
+
+def get_denoised_echogram(apres_data: dict, output_dir: str = None, method: str = 'median', subband: str = 'full') -> np.ndarray:
     """Get denoised echogram from pre-computed file or compute on the fly.
     
     Parameters
@@ -125,36 +210,50 @@ def get_denoised_echogram(apres_data: dict, output_dir: str = None, method: str 
     output_dir : str, optional
         Directory containing pre-computed files
     method : str
-        Denoising method: 'median' or 'svd' (only median supported for on-the-fly)
+        Denoising method: 'median' or 'svd'
+    subband : str
+        Subband used ('full', 'low', 'high')
     """
     global _denoised_cache
     
-    cache_key = (id(apres_data['range_img']), method)
+    cache_key = (id(apres_data['range_img']), method, subband)
     if cache_key in _denoised_cache:
+        print(f"Using cached {method} {subband} echo")
         return _denoised_cache[cache_key]
     
     # Try to load pre-computed
     if output_dir:
-        denoised = load_denoised_echogram(output_dir, method)
-        if denoised is not None:
-            print(f"Loaded pre-computed denoised echogram ({method})")
-            _denoised_cache[cache_key] = denoised
-            return denoised
+        filename = f'echogram_denoised_{method}.mat' if subband == 'full' else f'echogram_denoised_{method}_{subband}.mat'
+        denoised_path = Path(output_dir) / filename
+        if denoised_path.exists():
+            try:
+                data = loadmat(str(denoised_path))
+                key = f'range_img_denoised_{method}'
+                if key in data:
+                    denoised = np.array(data[key])
+                    _denoised_cache[cache_key] = denoised
+                    return denoised
+                elif 'range_img_denoised' in data:
+                    denoised = np.array(data['range_img_denoised'])
+                    _denoised_cache[cache_key] = denoised
+                    return denoised
+            except Exception as e:
+                print(f"Could not load denoised {subband} echogram: {e}")
     
-    # Fall back to computing (only median supported on-the-fly, SVD is too slow)
+    # Compute on-the-fly
+    range_img = apres_data['range_img']
+    
     if method == 'svd':
-        print("SVD denoising not pre-computed. Run precompute_denoised.py first.")
-        print("Falling back to median filter...")
-        # Check if we have median cached
-        median_key = (id(apres_data['range_img']), 'median')
-        if median_key in _denoised_cache:
-            return _denoised_cache[median_key]
+        print(f"Computing SVD denoised echogram for {subband} on-the-fly...")
+        denoised = apply_svd_denoising(range_img)
+        _denoised_cache[cache_key] = denoised
+        print(f"SVD denoising complete for {subband}.")
+        return denoised
     
-    print("Computing denoised echogram (run precompute_denoised.py for faster startup)...")
-    denoised = apply_fast_denoising(apres_data['range_img'])
-    # Cache as median
-    _denoised_cache[(id(apres_data['range_img']), 'median')] = denoised
-    print("Denoising complete.")
+    print(f"Computing median denoised echogram for {subband}...")
+    denoised = apply_fast_denoising(range_img)
+    _denoised_cache[cache_key] = denoised
+    print(f"Median denoising complete for {subband}.")
     
     return denoised
 
@@ -179,6 +278,14 @@ def load_all_results(output_dir: str) -> dict:
     velocity_path = output_path / 'velocity_profile.mat'
     if velocity_path.exists():
         results['velocity'] = loadmat(str(velocity_path))
+    else:
+        results['velocity'] = {
+            'depths': np.array([]),
+            'velocities': np.array([]),
+            'velocities_smooth': np.array([]),
+            'r_squared': np.array([]),
+            'reliable': np.array([], dtype=bool)
+        }
     
     # Load velocity JSON for summary
     velocity_json = output_path / 'velocity_profile.json'
@@ -189,6 +296,17 @@ def load_all_results(output_dir: str) -> dict:
     # Extract deep layers from the velocity summary JSON
     # These have tracking_mode == 'deep_segment_stitched'
     results['deep_layers'] = _extract_deep_layers(results.get('velocity_summary'))
+    
+    # Load optimal tracking
+    optimal_path = output_path / 'optimal_tracking.mat'
+    if optimal_path.exists():
+        results['optimal'] = loadmat(str(optimal_path))
+        
+    # Load phase-slope velocity profile (SVD-denoised velocity estimation)
+    phase_slope_json = output_path / 'slope_vel_full_local_k3_20m.json'
+    if phase_slope_json.exists():
+        with open(phase_slope_json, 'r') as f:
+            results['phase_slope'] = json.load(f)
     
     return results
 
@@ -447,7 +565,8 @@ def create_3d_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
                                range_timeseries: np.ndarray = None,
                                phase_time: np.ndarray = None,
                                color_mode: str = 'amplitude',
-                               initial_depths: np.ndarray = None) -> go.Figure:
+                               initial_depths: np.ndarray = None,
+                               subband: str = 'full') -> go.Figure:
     """
     Create an interactive 3D surface plot of the echogram.
     
@@ -485,7 +604,7 @@ def create_3d_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
     """
     # Use denoised data if requested
     if denoise:
-        range_img = get_denoised_echogram(apres_data, output_dir, method=denoise_method)
+        range_img = get_denoised_echogram(apres_data, output_dir, method=denoise_method, subband=subband)
     else:
         range_img = apres_data['range_img']
     Rcoarse = apres_data['Rcoarse']
@@ -494,14 +613,14 @@ def create_3d_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
     # Mask to selected depth range
     depth_mask = (Rcoarse >= depth_range[0]) & (Rcoarse <= depth_range[1])
     depths_sel = Rcoarse[depth_mask][::depth_subsample]
-    echogram_sel = range_img[depth_mask, :][::depth_subsample, ::time_subsample]
+    echogram_sel = fetch_zarr_slice(range_img, depth_mask, depth_subsample, time_subsample)
     time_sel = time_days[::time_subsample]
     
     # Convert to dB
     echogram_db = 10 * np.log10(echogram_sel**2 + 1e-30)
     
     # Clip for better visualization
-    echogram_db = np.clip(echogram_db, -25, 50)
+    echogram_db = np.clip(echogram_db, -10, 50)
     
     # Create meshgrid for surface
     T, D = np.meshgrid(time_sel, depths_sel)
@@ -517,9 +636,15 @@ def create_3d_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
         title_suffix = ""
     if color_mode == 'phase' and apres_data.get('raw_complex') is not None:
         title_suffix += " (Phase Colored)"
+    elif color_mode == 'phase_detrended' and apres_data.get('raw_complex') is not None:
+        title_suffix += " (Phase Detrended)"
+        
+    if subband != 'full':
+        title_suffix += f" ({subband.upper()} Sub-band)"
     
     raw_complex = apres_data.get('raw_complex')
     phase_color = color_mode == 'phase' and raw_complex is not None
+    phase_detrended = color_mode == 'phase_detrended' and raw_complex is not None
 
     surfacecolor = None
     colorscale = 'Turbo'
@@ -529,13 +654,21 @@ def create_3d_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
     hovertemplate = 'Time: %{x:.1f} days<br>Depth: %{y:.1f} m<br>Amp: %{z:.1f} dB<extra></extra>'
 
     if phase_color:
-        complex_sel = raw_complex[depth_mask, :][::depth_subsample, ::time_subsample]
+        complex_sel = fetch_zarr_slice(raw_complex, depth_mask, depth_subsample, time_subsample)
         phase_values = np.angle(complex_sel)
         surfacecolor = phase_values
         colorscale = 'Twilight'
         cmin = -np.pi
         cmax = np.pi
         colorbar_title = 'Phase (rad)'
+        hovertemplate = 'Time: %{x:.1f} days<br>Depth: %{y:.1f} m<br>Amp: %{z:.1f} dB<br>Phase: %{surfacecolor:.2f} rad<extra></extra>'
+    elif phase_detrended:
+        phase_det_full = compute_detrended_phase(raw_complex, Rcoarse, depth_mask=depth_mask)
+        surfacecolor = phase_det_full[::depth_subsample, ::time_subsample]
+        colorscale = 'Twilight'
+        cmin = -np.pi
+        cmax = np.pi
+        colorbar_title = 'Phase (detrended, rad)'
         hovertemplate = 'Time: %{x:.1f} days<br>Depth: %{y:.1f} m<br>Amp: %{z:.1f} dB<br>Phase: %{surfacecolor:.2f} rad<extra></extra>'
 
     # Add 3D surface
@@ -663,7 +796,7 @@ def create_3d_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
             aspectmode='manual',
             aspectratio=dict(x=1.5, y=1, z=0.5),
         ),
-        height=700,
+        height=850,
         margin=dict(l=0, r=0, t=50, b=0),
         template='plotly_white',
         font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
@@ -737,7 +870,7 @@ def create_3d_phase_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
     time_sel = time_days[::time_subsample]
 
     # Get phase directly from complex data
-    complex_sel = raw_complex[depth_mask, :][::depth_subsample, ::time_subsample]
+    complex_sel = fetch_zarr_slice(raw_complex, depth_mask, depth_subsample, time_subsample)
     raw_phase = np.angle(complex_sel)
     
     if phase_mode == 'unwrapped':
@@ -871,7 +1004,7 @@ def create_3d_phase_echogram_figure(apres_data: dict, layer_depths: np.ndarray,
             aspectmode='manual',
             aspectratio=dict(x=1.5, y=1, z=0.4),
         ),
-        height=650,
+        height=850,
         margin=dict(l=0, r=0, t=50, b=0),
         template='plotly_white',
         font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
@@ -893,6 +1026,7 @@ def create_2d_echogram_figure(
     initial_depths: np.ndarray = None,
     time_step: int = None,
     depth_step: int = 1,
+    subband: str = 'full',
 ) -> go.Figure:
     """
     Create a 2D echogram heatmap view with optional denoising and layer overlay.
@@ -922,7 +1056,7 @@ def create_2d_echogram_figure(
     """
     # Use denoised data if requested
     if denoise:
-        range_img = get_denoised_echogram(apres_data, output_dir, method=denoise_method)
+        range_img = get_denoised_echogram(apres_data, output_dir, method=denoise_method, subband=subband)
     else:
         range_img = apres_data['range_img']
     
@@ -930,7 +1064,8 @@ def create_2d_echogram_figure(
     time_days = apres_data['time_days']
 
     depth_mask = (Rcoarse >= depth_range[0]) & (Rcoarse <= depth_range[1])
-    echogram_db = 10 * np.log10(range_img[depth_mask, :]**2 + 1e-30)
+    range_img_sel = fetch_zarr_slice(range_img, depth_mask)
+    echogram_db = 10 * np.log10(range_img_sel**2 + 1e-30)
     echogram_db = np.clip(echogram_db, -25, 50)
 
     step = time_step if time_step is not None else max(1, len(time_days) // 400)
@@ -997,6 +1132,30 @@ def create_2d_echogram_figure(
                     annotation_position='right',
                 )
 
+    # Calculate and display theoretical vertical range resolution
+    speed_of_light_ice = 168e6 # m/s
+    
+    if subband == 'full':
+        bandwidth = 200e6
+    else:
+        bandwidth = 100e6
+        
+    # Range resolution = c / (2 * B). Blackman window broadens it by ~1.9x
+    ideal_resolution_m = speed_of_light_ice / (2.0 * bandwidth)
+    effective_resolution_m = ideal_resolution_m * 1.9
+    
+    fig.add_annotation(
+        text=f"<b>Range Resolution:</b> ~{effective_resolution_m*100:.0f} cm<br><b>Sub-Band:</b> {subband.capitalize()}",
+        xref="paper", yref="paper",
+        x=0.01, y=0.98,
+        showarrow=False,
+        bgcolor="rgba(255, 255, 255, 0.8)",
+        bordercolor="rgba(0,0,0,0.3)",
+        borderpad=4,
+        font=dict(size=11, color="black"),
+        align="left"
+    )
+
     fig.update_layout(
         title=f'Echogram (2D){title_suffix}',
         height=500,
@@ -1011,6 +1170,63 @@ def create_2d_echogram_figure(
     return fig
 
 
+def compute_detrended_phase(raw_complex: np.ndarray, Rcoarse: np.ndarray,
+                             depth_mask: np.ndarray = None) -> np.ndarray:
+    """
+    Remove the λ_c/2 spatial phase periodicity by detrending.
+    
+    The raw ApRES complex signal contains a spatial phase oscillation at
+    ~λ_c/2 ≈ 28 cm due to imperfect carrier phase removal. This is
+    time-invariant and can be removed by estimating the mean spatial
+    phase gradient and multiplying by exp(-i·g·depth).
+    
+    Parameters
+    ----------
+    raw_complex : np.ndarray
+        Complex echogram [n_depths, n_times]
+    Rcoarse : np.ndarray
+        Depth array (m)
+    depth_mask : np.ndarray, optional
+        Boolean mask for depth selection (applied before computation)
+    
+    Returns
+    -------
+    np.ndarray
+        Phase values (wrapped, -π to π) after detrending
+    """
+    if depth_mask is not None:
+        complex_sel = fetch_zarr_slice(raw_complex, depth_mask)
+        depths = Rcoarse[depth_mask]
+    else:
+        complex_sel = np.asarray(raw_complex)
+        depths = np.asarray(Rcoarse)
+    
+    # Estimate spatial phase gradient from a sample of time steps
+    n_times = complex_sel.shape[1]
+    sample_idx = np.linspace(0, n_times - 1, min(50, n_times), dtype=int)
+    
+    gradients = []
+    for ti in sample_idx:
+        col = complex_sel[:, ti]
+        phase_col = np.unwrap(np.angle(col))
+        # Linear fit: phase = grad * depth + offset
+        valid = np.isfinite(phase_col) & (np.abs(col) > 1e-20)
+        if valid.sum() > 10:
+            coeffs = np.polyfit(depths[valid], phase_col[valid], 1)
+            gradients.append(coeffs[0])
+    
+    if not gradients:
+        return np.angle(complex_sel)
+    
+    grad_mean = np.median(gradients)
+    
+    # Apply correction: multiply by exp(-i * grad * depth)
+    correction = np.exp(-1j * grad_mean * depths)
+    corrected = complex_sel * correction[:, np.newaxis]
+    
+    return np.angle(corrected)
+
+
 def create_2d_phase_figure(
     apres_data: dict, 
     depth_range: tuple = (50, 1200),
@@ -1022,6 +1238,7 @@ def create_2d_phase_figure(
     initial_depths: np.ndarray = None,
     time_step: int = None,
     depth_step: int = 1,
+    subband: str = 'full',
 ) -> go.Figure:
     """
     Create a 2D phase heatmap view with optional layer overlay.
@@ -1064,8 +1281,10 @@ def create_2d_phase_figure(
     Rcoarse = apres_data['Rcoarse']
     time_days = apres_data['time_days']
 
+    # Mask to selected depth range first to save time on unwrapping
     depth_mask = (Rcoarse >= depth_range[0]) & (Rcoarse <= depth_range[1])
-    complex_sel = raw_complex[depth_mask, :]
+    complex_sel = fetch_zarr_slice(raw_complex, depth_mask)
+    depths_sel = Rcoarse[depth_mask]
     
     # Compute phase
     phase = np.angle(complex_sel)
@@ -1138,7 +1357,7 @@ def create_2d_phase_figure(
     title_suffix = ' (Wrapped)' if phase_mode == 'wrapped' else ' (Unwrapped)'
     fig.update_layout(
         title=f'Phase (2D){title_suffix}',
-        height=500,
+        height=750,
         template='plotly_white',
         font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
         margin=dict(l=40, r=10, t=40, b=40),
@@ -1173,7 +1392,7 @@ def compute_layer_detection_overlay(range_img: np.ndarray, method: str = 'gradie
         Detection overlay (same shape as input), higher values = stronger layer signal
     """
     # Convert to dB for processing
-    img_db = 10 * np.log10(range_img**2 + 1e-30)
+    img_db = 10 * np.log10(np.asarray(range_img)**2 + 1e-30)
     
     if method == 'gradient':
         # Vertical gradient magnitude - layer boundaries have high gradient
@@ -1229,6 +1448,7 @@ def create_2d_detection_overlay_figure(
     initial_depths: np.ndarray = None,
     time_step: int = None,
     depth_step: int = 1,
+    subband: str = 'full',
 ) -> go.Figure:
     """
     Create a 2D layer detection overlay visualization.
@@ -1265,7 +1485,7 @@ def create_2d_detection_overlay_figure(
     """
     # Use denoised data if requested
     if denoise:
-        range_img = get_denoised_echogram(apres_data, output_dir, method=denoise_method)
+        range_img = get_denoised_echogram(apres_data, output_dir, method=denoise_method, subband=subband)
     else:
         range_img = apres_data['range_img']
     
@@ -1273,7 +1493,7 @@ def create_2d_detection_overlay_figure(
     time_days = apres_data['time_days']
 
     depth_mask = (Rcoarse >= depth_range[0]) & (Rcoarse <= depth_range[1])
-    img_sel = range_img[depth_mask, :]
+    img_sel = fetch_zarr_slice(range_img, depth_mask)
     
     # Compute detection overlay
     detection = compute_layer_detection_overlay(img_sel, method=method)
@@ -1348,7 +1568,7 @@ def create_2d_detection_overlay_figure(
     
     fig.update_layout(
         title=title,
-        height=500,
+        height=750,
         template='plotly_white',
         font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
         margin=dict(l=40, r=10, t=40, b=40),
@@ -1391,9 +1611,10 @@ def create_summary_figure(results: dict, apres_data: dict) -> go.Figure:
         vertical_spacing=0.12,
     )
     
-    # Subsample echogram
+    # Extract selected range safely for Zarr
     depth_mask = (Rcoarse >= 50) & (Rcoarse <= 1000)
-    echogram_db = 10 * np.log10(range_img[depth_mask, :]**2 + 1e-30)
+    range_img_sel = fetch_zarr_slice(range_img, depth_mask)
+    echogram_db = 10 * np.log10(range_img_sel**2 + 1e-30)
     
     step = max(1, len(time_days) // 300)
     
@@ -1537,7 +1758,7 @@ def create_time_averaged_echogram_figure(apres_data: dict) -> go.Figure:
     range_img = apres_data['range_img']
     depths = apres_data['Rcoarse']
 
-    mean_db = 10 * np.log10(np.mean(range_img**2, axis=1) + 1e-30)
+    mean_db = 10 * np.log10(np.mean(np.asarray(range_img)**2, axis=1) + 1e-30)
 
     fig = go.Figure()
     fig.add_trace(
@@ -1568,10 +1789,13 @@ def create_velocity_profile_with_sea_surface(
     sea_surface_r_squared: float,
     ice_thickness: float = 1094.0,
     deep_layers: dict | None = None,
+    show_deep: bool = True,
+    show_optimal: bool = True,
+    phase_slope: dict | None = None,
 ) -> go.Figure:
     """Create velocity profile with interpolation including lake/sea surface.
     
-    Shows observed layer velocities and an interpolated velocity trend
+    Shows observed layer velocities and a linear (Nye) fit
     from the ice surface through internal layers to the lake surface.
     Deep layers (if provided) are shown as distinct diamond/square/triangle
     markers colored by quality tier.
@@ -1583,8 +1807,10 @@ def create_velocity_profile_with_sea_surface(
         sea_surface_r_squared: R² of sea surface fit
         ice_thickness: Total ice thickness (m), unused but kept for API compatibility
         deep_layers: Deep layer detection results dict (from _extract_deep_layers)
+        show_deep: Whether to show deep layers (default True)
+        phase_slope: Phase-slope velocity results dict (from radon_velocity.py JSON output)
     """
-    from scipy.interpolate import UnivariateSpline
+
     
     velocity_data = results['velocity']
     depths = velocity_data['depths'].flatten()
@@ -1606,7 +1832,7 @@ def create_velocity_profile_with_sea_surface(
         rows=1, cols=2,
         subplot_titles=(
             "Observed Layer Velocities",
-            "Interpolated Velocity Profile"
+            "Linear (Nye) Fit"
         ),
         column_widths=[0.5, 0.5],
         horizontal_spacing=0.12,
@@ -1661,7 +1887,7 @@ def create_velocity_profile_with_sea_surface(
     fig.add_trace(go.Scatter(**reliable_kwargs), row=1, col=1)
     
     # Deep layers (segment-stitched tracking)
-    if deep_layers is not None and deep_layers.get('available', False):
+    if show_deep and deep_layers is not None and deep_layers.get('available', False):
         dl_depths = deep_layers['depths']
         dl_vels = deep_layers['velocities']
         dl_r2 = deep_layers['r_squared']
@@ -1707,6 +1933,58 @@ def create_velocity_profile_with_sea_surface(
                 customdata=dl_r2[t3],
             ), row=1, col=1)
     
+    # Optimal tracked layers
+    optimal = results.get('optimal')
+    if optimal and show_optimal:
+        opt_depths = optimal.get('layer_depths', np.array([])).flatten()
+        opt_vels = optimal.get('velocities_m_yr', np.array([])).flatten()
+        
+        if opt_vels.size > 0 and opt_depths.size > 0:
+            # Determine R^2 if available (fallback to 1 if missing for optimal)
+            opt_r2 = optimal.get('r_squared', np.ones_like(opt_vels)).flatten()
+            
+            # Valid values
+            valid_opt = np.isfinite(opt_vels)
+            
+            if valid_opt.any():
+                fig.add_trace(go.Scatter(
+                    x=opt_vels[valid_opt], y=opt_depths[valid_opt],
+                    mode='markers',
+                    marker=dict(color='#3b82f6', size=11, symbol='star-diamond',
+                                line=dict(color='white', width=1)),
+                    name=f'Optimal Viterbi ({valid_opt.sum()})',
+                    hovertemplate='Depth: %{y:.0f}m<br>v: %{x:.3f} m/yr<br>R²: %{customdata:.3f}<extra>Optimal Track</extra>',
+                    customdata=opt_r2[valid_opt]
+                ), row=1, col=1)
+
+    # Phase-slope velocity profile (SVD-denoised, windowed)
+    if phase_slope is not None:
+        ps_depths = np.array(phase_slope['depths'])
+        ps_vel = np.array(phase_slope['phase_slope_velocities'])
+        ps_r2 = np.array(phase_slope.get('phase_slope_r2', []))
+        ps_ng = np.array(phase_slope.get('phase_slope_n_good', []))
+        valid = np.isfinite(ps_vel)
+        if valid.any():
+            svd_mode = phase_slope.get('svd_mode', 'local')
+            k = phase_slope.get('svd_components', 3)
+            win = phase_slope.get('window_m', 20)
+            hover_text = [
+                f"Depth: {d:.0f}m<br>v: {v:.4f} m/yr<br>R²: {r:.3f}<br>n_good: {n}"
+                for d, v, r, n in zip(ps_depths[valid], ps_vel[valid],
+                                       ps_r2[valid] if len(ps_r2) else [0]*valid.sum(),
+                                       ps_ng[valid] if len(ps_ng) else [0]*valid.sum())
+            ]
+            fig.add_trace(go.Scatter(
+                x=ps_vel[valid], y=ps_depths[valid],
+                mode='markers+lines',
+                marker=dict(color='#2ca25f', size=9, symbol='hexagon2',
+                            line=dict(color='white', width=1)),
+                line=dict(color='#2ca25f', width=1.5, dash='dot'),
+                name=f'Phase-slope ({svd_mode} SVD k={k}, {win:.0f}m)',
+                hovertext=hover_text,
+                hoverinfo='text',
+            ), row=1, col=1)
+    
     # Lake/sea surface point
     if not np.isnan(sea_surface_velocity):
         fig.add_trace(
@@ -1742,89 +2020,77 @@ def create_velocity_profile_with_sea_surface(
     # Zero velocity reference
     fig.add_vline(x=0, line=dict(color='#64748b', dash='dash', width=1), row=1, col=1)
     
-    # Panel 2: Interpolated profile including lake surface
+    # Panel 2: Linear (Nye) fit including lake surface
     if np.sum(reliable) > 3 and not np.isnan(sea_surface_velocity):
-        # Combine reliable layer velocities with lake surface
-        interp_depths = np.concatenate([depths[reliable], [sea_surface_depth]])
-        interp_velocities = np.concatenate([velocities[reliable], [sea_surface_velocity]])
+        H = sea_surface_depth
+        
+        # Combine reliable layer velocities with lake surface for fitting
+        fit_depths = np.concatenate([depths[reliable], [sea_surface_depth]])
+        fit_velocities = np.concatenate([velocities[reliable], [sea_surface_velocity]])
+        
+        # Also include deep layers in the fit if shown
+        if show_deep and deep_layers is not None and deep_layers.get('available', False):
+            fit_depths = np.concatenate([fit_depths, deep_layers['depths']])
+            fit_velocities = np.concatenate([fit_velocities, deep_layers['velocities']])
+            
+        # Include optimal layers in the fit if shown
+        if optimal and show_optimal:
+            opt_d = optimal.get('layer_depths', np.array([])).flatten()
+            opt_v = optimal.get('velocities_m_yr', np.array([])).flatten()
+            
+            if opt_v.size > 0 and opt_d.size > 0:
+                opt_ok = np.isfinite(opt_v)
+                if opt_ok.any():
+                    fit_depths = np.concatenate([fit_depths, opt_d[opt_ok]])
+                    fit_velocities = np.concatenate([fit_velocities, opt_v[opt_ok]])
+        
+        # Include phase-slope velocities in the fit if provided
+        if phase_slope is not None:
+            ps_d = np.array(phase_slope['depths'])
+            ps_v = np.array(phase_slope['phase_slope_velocities'])
+            ps_ok = np.isfinite(ps_v)
+            if ps_ok.any():
+                fit_depths = np.concatenate([fit_depths, ps_d[ps_ok]])
+                fit_velocities = np.concatenate([fit_velocities, ps_v[ps_ok]])
         
         # Sort by depth
-        sort_idx = np.argsort(interp_depths)
-        interp_depths = interp_depths[sort_idx]
-        interp_velocities = interp_velocities[sort_idx]
+        sort_idx = np.argsort(fit_depths)
+        fit_depths = fit_depths[sort_idx]
+        fit_velocities = fit_velocities[sort_idx]
         
         # Remove NaN values
-        valid = ~np.isnan(interp_velocities)
-        interp_depths = interp_depths[valid]
-        interp_velocities = interp_velocities[valid]
+        valid = ~np.isnan(fit_velocities)
+        fit_depths = fit_depths[valid]
+        fit_velocities = fit_velocities[valid]
         
-        # Create smooth interpolation
-        depth_grid = np.linspace(interp_depths.min(), interp_depths.max(), 200)
+        depth_grid = np.linspace(0, H, 300)
         
-        try:
-            # Use spline interpolation with moderate smoothing
-            spline = UnivariateSpline(interp_depths, interp_velocities, 
-                                       s=len(interp_depths) * 0.05, k=3)
-            velocity_interp = spline(depth_grid)
-        except Exception:
-            # Fallback to linear interpolation
-            velocity_interp = np.interp(depth_grid, interp_depths, interp_velocities)
+        # Linear (Nye) fit: w(z) = w_s + eps_zz * z
+        nye_coeffs = np.polyfit(fit_depths, fit_velocities, 1)
+        velocity_model = nye_coeffs[1] + nye_coeffs[0] * depth_grid
+        predicted_at_obs = nye_coeffs[1] + nye_coeffs[0] * fit_depths
         
         # Compute fit statistics
-        predicted_at_obs = np.interp(interp_depths, depth_grid, velocity_interp)
-        ss_res = np.sum((interp_velocities - predicted_at_obs) ** 2)
-        ss_tot = np.sum((interp_velocities - np.mean(interp_velocities)) ** 2)
+        ss_res = np.sum((fit_velocities - predicted_at_obs) ** 2)
+        ss_tot = np.sum((fit_velocities - np.mean(fit_velocities)) ** 2)
         interp_r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
         
-        # Plot interpolated trend
+        eps_zz = nye_coeffs[0]
+        w_s = nye_coeffs[1]
+        
+        # Plot linear fit
         fig.add_trace(
             go.Scatter(
-                x=velocity_interp,
+                x=velocity_model,
                 y=depth_grid,
                 mode='lines',
                 line=dict(color='#8b5cf6', width=3),
-                name='Spline interpolation',
+                name=f'Linear fit (R\u00b2={interp_r2:.4f})',
                 fill='tozerox',
                 fillcolor='rgba(139, 92, 246, 0.1)',
             ),
             row=1, col=2
         )
-        
-        # Add uncertainty envelope around spline if available
-        if has_uncertainty:
-            # Interpolate uncertainty to the depth grid
-            unc_at_layers = uncertainty_kingslake[reliable]
-            # Build uncertainty on the depth grid by interpolation
-            sort_rel = np.argsort(depths[reliable])
-            unc_interp = np.interp(depth_grid, depths[reliable][sort_rel], unc_at_layers[sort_rel])
-            
-            # Upper bound (go top to bottom)
-            fig.add_trace(
-                go.Scatter(
-                    x=velocity_interp + unc_interp,
-                    y=depth_grid,
-                    mode='lines',
-                    line=dict(width=0),
-                    showlegend=False,
-                    hoverinfo='skip',
-                ),
-                row=1, col=2
-            )
-            # Lower bound with fill to upper
-            fig.add_trace(
-                go.Scatter(
-                    x=velocity_interp - unc_interp,
-                    y=depth_grid,
-                    mode='lines',
-                    line=dict(width=0),
-                    fill='tonextx',
-                    fillcolor='rgba(139, 92, 246, 0.2)',
-                    showlegend=True,
-                    name=f'Uncertainty envelope (± σ)',
-                    hoverinfo='skip',
-                ),
-                row=1, col=2
-            )
         
         # Add reliable layer data points (with uncertainty bars if available)
         interp_layer_kwargs = dict(
@@ -1851,7 +2117,7 @@ def create_velocity_profile_with_sea_surface(
         fig.add_trace(go.Scatter(**interp_layer_kwargs), row=1, col=2)
         
         # Deep layers on interpolation panel
-        if deep_layers is not None and deep_layers.get('available', False):
+        if show_deep and deep_layers is not None and deep_layers.get('available', False):
             fig.add_trace(go.Scatter(
                 x=deep_layers['velocities'], y=deep_layers['depths'],
                 mode='markers',
@@ -1861,6 +2127,41 @@ def create_velocity_profile_with_sea_surface(
                 showlegend=False,
                 hovertemplate='Depth: %{y:.0f}m<br>v: %{x:.3f} m/yr<extra>Deep</extra>',
             ), row=1, col=2)
+            
+        # Optimal layers on interpolation panel
+        if optimal and show_optimal:
+            opt_d = optimal.get('layer_depths', np.array([])).flatten()
+            opt_v = optimal.get('velocities_m_yr', np.array([])).flatten()
+            
+            if opt_v.size > 0 and opt_d.size > 0:
+                opt_ok = np.isfinite(opt_v)
+                if opt_ok.any():
+                    fig.add_trace(go.Scatter(
+                        x=opt_v[opt_ok], y=opt_d[opt_ok],
+                        mode='markers',
+                        marker=dict(color='#3b82f6', size=9, symbol='star-diamond',
+                                    line=dict(color='white', width=0.5)),
+                        name='Optimal Viterbi',
+                        showlegend=False,
+                        hovertemplate='Depth: %{y:.0f}m<br>v: %{x:.3f} m/yr<extra>Optimal</extra>',
+                    ), row=1, col=2)
+        
+        # Phase-slope on interpolation panel
+        if phase_slope is not None:
+            ps_depths = np.array(phase_slope['depths'])
+            ps_vel = np.array(phase_slope['phase_slope_velocities'])
+            valid = np.isfinite(ps_vel)
+            if valid.any():
+                fig.add_trace(go.Scatter(
+                    x=ps_vel[valid], y=ps_depths[valid],
+                    mode='markers+lines',
+                    marker=dict(color='#2ca25f', size=7, symbol='hexagon2',
+                                line=dict(color='white', width=0.5)),
+                    line=dict(color='#2ca25f', width=1.5, dash='dot'),
+                    name='Phase-slope',
+                    showlegend=False,
+                    hovertemplate='Depth: %{y:.0f}m<br>v: %{x:.4f} m/yr<extra>Phase-slope</extra>',
+                ), row=1, col=2)
         
         # Lake surface marker (important constraint)
         fig.add_trace(
@@ -1884,11 +2185,13 @@ def create_velocity_profile_with_sea_surface(
         )
         
         # Add annotation with statistics
+        n_fit_pts = len(fit_depths)
         fig.add_annotation(
             x=0.98, y=0.02,
             xref='x2 domain', yref='y2 domain',
-            text=f"Lake surface: {sea_surface_velocity:.4f} m/yr (R²={sea_surface_r_squared:.2f})<br>"
-                 f"Interpolation includes {np.sum(reliable)} layers + lake",
+            text=f"Lake surface: {sea_surface_velocity:.4f} m/yr (R\u00b2={sea_surface_r_squared:.2f})<br>"
+                 f"Linear fit: w\u209b={w_s:.4f} m/yr, \u03b5\u0307_zz={eps_zz:.2e} /yr<br>"
+                 f"{n_fit_pts} points, R\u00b2={interp_r2:.4f}",
             showarrow=False,
             font=dict(size=11),
             bgcolor='rgba(255,255,255,0.9)',
@@ -1930,7 +2233,7 @@ def estimate_lake_surface(apres_data: dict, target_depth: float = 1094.0, window
         return time_days, np.full_like(time_days, np.nan, dtype=float), np.full_like(time_days, np.nan, dtype=float)
 
     depth_candidates = depths[depth_mask]
-    amp_window = range_img[depth_mask, :]
+    amp_window = fetch_zarr_slice(range_img, depth_mask)
 
     lake_depths = np.full(amp_window.shape[1], np.nan, dtype=float)
     lake_amp = np.full(amp_window.shape[1], np.nan, dtype=float)
@@ -1982,10 +2285,13 @@ def track_sea_surface_phase(apres_data: dict, target_depth: float = 1094.0,
     
     depth_indices = np.where(depth_mask)[0]
     
-    # Find initial peak location
-    amp_init = np.abs(range_img[depth_mask, 0])
-    peak_idx_local = np.argmax(amp_init)
-    peak_idx = depth_indices[peak_idx_local]
+    # Get initial peak tracking parameters
+    i0, i1 = depth_indices[0], depth_indices[-1] + 1
+    amp_init = np.abs(fetch_zarr_slice(range_img, depth_mask)[:, 0]) # Get first column of masked range_img
+    
+    # Use amplitude peak as starting point
+    local_peak_idx = np.argmax(amp_init)
+    peak_idx = depth_indices[local_peak_idx]
     initial_depth = depths[peak_idx]
     
     # Compute rfine from complex phase
@@ -2189,6 +2495,95 @@ def create_lake_surface_figure(time_days: np.ndarray, tracked_depths: np.ndarray
     return fig
 
 
+_apres_data_cache = {}
+
+def get_apres_data(base_path: str, subband: str = 'full') -> dict:
+    global _apres_data_cache
+    
+    if subband in _apres_data_cache:
+        return _apres_data_cache[subband]
+        
+    path = Path(base_path)
+    if subband == 'low':
+        actual_path = path.parent / f"{path.stem}_low"
+    elif subband == 'high':
+        actual_path = path.parent / f"{path.stem}_high"
+    else:
+        # Strip suffix to clean base name (handles both .mat and .zarr gracefully)
+        actual_path = path.with_suffix('')
+        
+    zarr_path = actual_path.with_suffix('.zarr')
+    mat_path = actual_path.with_suffix('.mat')
+    
+    # Check if either format exists for the requested subband
+    if not zarr_path.exists() and not mat_path.exists():
+        print(f"Subband files not found for {subband}, falling back to full.")
+        if 'full' in _apres_data_cache:
+            return _apres_data_cache['full']
+        zarr_path = path.with_suffix('.zarr')
+        mat_path = path.with_suffix('.mat')
+
+    # 1. Prefer Zarr for instant lazy-loading (Zero RAM footprint!)
+    if zarr_path.exists():
+        print(f"Lazy loading {subband} data from Zarr: {zarr_path}...")
+        try:
+            root = zarr.open(str(zarr_path), mode='r')
+            raw_complex = root['raw_complex'] if 'raw_complex' in root else None
+            
+            # Derive range_img from abs(raw_complex) when available.
+            # This matches the MAT loader behaviour: abs(coherent mean)
+            # produces a naturally smoother image than the stored RawImage
+            # (which is the incoherent mean of magnitudes).
+            if raw_complex is not None:
+                print(f"  Computing range_img = abs(raw_complex) for {subband}...")
+                range_img = np.abs(np.array(raw_complex)).astype(np.float32)
+                print(f"  Done. Shape: {range_img.shape}")
+            else:
+                range_img = np.array(root['range_img'])
+            
+            data = {
+                'range_img': range_img,
+                'raw_complex': raw_complex,
+                'range_img_incoherent': root['range_img'],  # keep original RawImage accessible
+                'Rcoarse': np.array(root['Rcoarse']),
+                'time_days': np.array(root['time_days']),
+            }
+            _apres_data_cache[subband] = data
+            return data
+        except Exception as e:
+            print(f"Error loading Zarr {zarr_path}: {e}")
+
+    # 2. Fallback to MATLAB .mat file (Loads multi-GBs into RAM)
+    print(f"Loading {subband} data from MAT: {mat_path}...")
+    try:
+        apres_mat = loadmat(str(mat_path))
+        raw_complex = np.array(apres_mat['RawImageComplex'], dtype=np.complex64) if 'RawImageComplex' in apres_mat else None
+        
+        if raw_complex is not None:
+            range_img = np.abs(raw_complex).astype(np.float32)
+        else:
+            range_img = np.array(apres_mat['RawImage'], dtype=np.float32)
+
+        data = {
+            'range_img': range_img,
+            'raw_complex': raw_complex,
+            'Rcoarse': apres_mat['Rcoarse'].flatten().astype(np.float32),
+            'time_days': apres_mat['TimeInDays'].flatten().astype(np.float32),
+        }
+        del apres_mat
+        gc.collect()
+        
+        keys_to_remove = [k for k in _apres_data_cache.keys() if k not in ('full', subband)]
+        for k in keys_to_remove:
+            del _apres_data_cache[k]
+            
+        _apres_data_cache[subband] = data
+        return data
+    except Exception as e:
+        print(f"Error loading MAT {mat_path}: {e}")
+        return _apres_data_cache.get('full', {})
+
+
 def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
     """Create interactive Dash application."""
     
@@ -2197,34 +2592,15 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
     
     # Load data
     results = load_all_results(output_dir)
-    apres_mat = loadmat(apres_data_path)
     
-    # Only load RawImageComplex - skip RawImage and RfineBarTime to save RAM
-    # RawImageComplex is sufficient: amplitude = abs(), phase = angle()
-    raw_complex = np.array(apres_mat['RawImageComplex']) if 'RawImageComplex' in apres_mat else None
-    
-    # Compute amplitude from complex (more accurate than RawImage)
-    if raw_complex is not None:
-        range_img = np.abs(raw_complex)
-    else:
-        range_img = np.array(apres_mat['RawImage'])
-
-    apres_data = {
-        'range_img': range_img,
-        'raw_complex': raw_complex,
-        'Rcoarse': apres_mat['Rcoarse'].flatten(),
-        'time_days': apres_mat['TimeInDays'].flatten(),
-    }
-    
-    # Free memory from loaded mat file
-    del apres_mat
+    # Initialize the default (full) apres data
+    apres_data = get_apres_data(apres_data_path, 'full')
     
     # Don't preload the denoised echogram - lazy load on first use instead
     # This saves startup time since the file is ~1GB
     print("Denoised echogram will be loaded on first use (lazy loading)")
     
-    # Create summary figure
-    summary_fig = create_summary_figure(results, apres_data)
+    # Create figures
     mean_echogram_fig = create_time_averaged_echogram_figure(apres_data)
     
     # Create Dash app
@@ -2293,6 +2669,20 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                 'label': f"{d_dl:.0f} m  Deep {stars_dl} (v={v_dl:.3f}, R\u00b2={r_dl:.3f})",
                 'value': 10000 + j,
             })
+            
+    # Add optimal tracking entries (offset by 20000 to distinguish)
+    opt = results.get('optimal')
+    if opt:
+        opt_depths = opt['layer_depths'].flatten()
+        for j in range(len(opt_depths)):
+            layer_options.append({
+                'label': f"{opt_depths[j]:.0f} m  (Optimal Viterbi Track)",
+                'value': 20000 + j,
+            })
+            highlight_options.append({
+                'label': f"{opt_depths[j]:.0f} m  (Optimal Viterbi Track)",
+                'value': 20000 + j,
+            })
     
     # Create initial 3D echograms
     lambdac = 0.5608
@@ -2314,7 +2704,7 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
         lambdac,
         highlighted_layers=None,
         phase_mode='wrapped',
-        depth_range=(50, 250),
+        depth_range=(500, 250),
     )
 
     least_rows = load_least_gaussian_rows(Path(output_dir))
@@ -2341,16 +2731,8 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
         sea_surface_velocity = np.nan
         sea_surface_r_squared = np.nan
     
-    # Create velocity profile with Glen's law comparison
+    # Deep layers (used by summary callback and interpretation callbacks)
     deep_layers = results.get('deep_layers', None)
-    velocity_profile_fig = create_velocity_profile_with_sea_surface(
-        results, 
-        sea_surface_depth=SEA_SURFACE_DEPTH,
-        sea_surface_velocity=sea_surface_velocity,
-        sea_surface_r_squared=sea_surface_r_squared,
-        ice_thickness=SEA_SURFACE_DEPTH,
-        deep_layers=deep_layers,
-    )
     
     app.layout = html.Div([
         html.Div([
@@ -2374,14 +2756,110 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
             ),
         ], style={'marginBottom': '24px'}),
         dcc.Tabs([
+            dcc.Tab(label='Introduction', children=[
+                html.Div([
+                    html.H2("Expedition Overview", style={'color': theme['text'], 'marginBottom': '20px'}),
+                    html.Div([
+                        html.Div([
+                            html.H3("Site Location", style={'color': theme['text'], 'marginBottom': '12px'}),
+                            html.Img(src='/assets/location_map.png', style={'width': '100%', 'borderRadius': '8px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.1)'}),
+                            html.P("Map showing the location of the ApRES deployment.", style={'color': theme['muted'], 'fontSize': '14px', 'marginTop': '8px', 'fontStyle': 'italic'})
+                        ], style={'flex': '1', 'marginRight': '30px', 'maxWidth': '50%'}),
+                        html.Div([
+                            html.H3("Data Acquisition Setup", style={'color': theme['text'], 'marginBottom': '12px'}),
+                            dcc.Markdown(r'''
+The **Autonomous Phase-Sensitive Radio Echo Sounder (ApRES)** provides millimeter-precision measurements of internal ice deformation and basal melt rates by transmitting a continuous, frequency-modulated signal (FMCW) into the ice.
+
+**Radar Parameters:**
+*   **Frequency Range:** 200 MHz to 400 MHz
+*   **Bandwidth ($B$):** 200 MHz
+*   **Center Frequency ($f_c$):** 300 MHz
+*   **Wavelength in Ice ($\lambda_c$):** ~0.56 m
+*   **Sampling Rate:** 40,000 Hz
+*   **Chirp Duration ($T$):** 1 Second
+*   **Pings per Burst:** 100 sub-bursts averaged to boost SNR
+*   **Temporal Resolution:** Daily bursts
+
+The radar is deployed on the ice surface, transmitting downward. Reflections occur at changes in dielectric permittivity, usually caused by density variations, chemical impurities, internal ice layers, or the ice-bed interface.
+                            ''', mathjax=True, style={'color': theme['text'], 'lineHeight': '1.6', 'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"})
+                        ], style={'flex': '1'})
+                    ], style={'display': 'flex', 'marginBottom': '40px'}),
+                    
+                    html.H3("Ice Column Architecture", style={'color': theme['text'], 'marginBottom': '12px'}),
+                    html.Div([
+                        html.Div([
+                            dcc.Markdown(r'''
+### Depth Profile
+*   **Surface:** 0 m (Antenna Location)
+*   **Solid Ice:** 0 m to ~850 m
+*   **Echo-Free Zone (EFZ):** ~850 m to ~1000 m
+    *(Region characterizing complex basal flow with scarce coherent internal reflections)*
+*   **Subglacial Lake:** ~1000 m+ (Ice-Water Interface)
+
+The ApRES receiver records a time-series of raw complex amplitudes across depth. The tracking algorithm isolates individual reflectors within the upper solid ice column. By monitoring the continuous phase change ($\Delta \phi$) of these isolated reflections over time, we calculate vertical layer velocities to millimeter precision.
+
+$$\text{Velocity} = \frac{\Delta \phi}{4\pi \Delta t} \lambda_c$$
+                            ''', mathjax=True, style={'color': theme['text'], 'lineHeight': '1.5'}),
+                        ], style={'flex': '1', 'marginRight': '20px'}),
+                        html.Div([
+                            dcc.Graph(
+                                id='ice-depth-diagram',
+                                config={'displayModeBar': False},
+                                figure={
+                                    'data': [
+                                        {'x': [0, 1, 1, 0, 0], 'y': [0, 0, 850, 850, 0], 'type': 'scatter', 'mode': 'lines', 'fill': 'toself', 'fillcolor': '#3b82f6', 'opacity': 0.4, 'name': 'Solid Ice', 'line': {'color': '#2563eb', 'width': 2}},
+                                        {'x': [0, 1, 1, 0, 0], 'y': [850, 850, 1000, 1000, 850], 'type': 'scatter', 'mode': 'lines', 'fill': 'toself', 'fillcolor': '#94a3b8', 'opacity': 0.3, 'name': 'Echo Free Zone', 'line': {'color': '#64748b', 'width': 2, 'dash': 'dot'}},
+                                        {'x': [0, 1, 1, 0, 0], 'y': [1000, 1000, 1200, 1200, 1000], 'type': 'scatter', 'mode': 'lines', 'fill': 'toself', 'fillcolor': '#0ea5e9', 'opacity': 0.6, 'name': 'Subglacial Lake', 'line': {'color': '#0284c7', 'width': 2}},
+                                        {'x': [0.5], 'y': [0], 'type': 'scatter', 'mode': 'markers', 'marker': {'symbol': 'triangle-down', 'size': 15, 'color': '#ef4444'}, 'name': 'ApRES Radar'},
+                                        {'x': [0.5, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75], 'y': [0, 800, 809, 816, 821, 824, 825, 824, 821, 816, 809, 800], 'type': 'scatter', 'mode': 'lines', 'fill': 'toself', 'fillcolor': 'rgba(239, 68, 68, 0.05)', 'name': 'Radar Beam Area', 'line': {'width': 0}, 'hoverinfo': 'skip'},
+                                        {'x': [0.38, 0.42, 0.46, 0.5, 0.54, 0.58, 0.62], 'y': [380, 392, 398, 400, 398, 392, 380], 'type': 'scatter', 'mode': 'lines', 'line': {'color': 'rgba(239, 68, 68, 0.3)', 'width': 2}, 'name': 'RF Wavefront', 'showlegend': False, 'hoverinfo': 'skip'},
+                                        {'x': [0.26, 0.34, 0.42, 0.5, 0.58, 0.66, 0.74], 'y': [760, 784, 796, 800, 796, 784, 760], 'type': 'scatter', 'mode': 'lines', 'line': {'color': 'rgba(239, 68, 68, 0.15)', 'width': 2}, 'name': 'RF Wavefront', 'showlegend': False, 'hoverinfo': 'skip'},
+                                        {'x': [0, 1], 'y': [200, 200], 'type': 'scatter', 'mode': 'lines', 'line': {'color': '#3b82f6', 'width': 2}, 'opacity': 0.6, 'name': 'Internal Layer', 'showlegend': False},
+                                        {'x': [0, 1], 'y': [400, 400], 'type': 'scatter', 'mode': 'lines', 'line': {'color': '#3b82f6', 'width': 2}, 'opacity': 0.6, 'name': 'Internal Layer', 'showlegend': True},
+                                        {'x': [0, 1], 'y': [600, 600], 'type': 'scatter', 'mode': 'lines', 'line': {'color': '#3b82f6', 'width': 2}, 'opacity': 0.6, 'name': 'Internal Layer', 'showlegend': False},
+                                    ],
+                                    'layout': {
+                                        'title': 'Schematic Ice Column Cross-Section',
+                                        'yaxis': {'title': 'Depth (m) [Negative = Deeper]', 'autorange': 'reversed', 'range': [1300, -100], 'zeroline': True},
+                                        'xaxis': {'showticklabels': False, 'showgrid': False, 'zeroline': False, 'range': [0, 1]},
+                                        'height': 350,
+                                        'margin': {'l': 60, 'r': 20, 't': 40, 'b': 20},
+                                        'plot_bgcolor': theme['bg'],
+                                        'paper_bgcolor': 'rgba(0,0,0,0)',
+                                        'showlegend': True,
+                                        'legend': {'orientation': 'h', 'y': 1.1, 'x': 0.5, 'xanchor': 'center'}
+                                    }
+                                }
+                            )
+                        ], style={'flex': '1.5'})
+                    ], style={'display': 'flex', 'backgroundColor': theme['bg'], 'padding': '20px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"})
+                ], style={
+                    'margin': '20px 18px 30px 18px',
+                    'padding': '24px',
+                    'backgroundColor': theme['panel'],
+                    'borderRadius': '16px',
+                    'border': f"1px solid {theme['border']}",
+                    'boxShadow': theme['shadow'],
+                })
+            ]),
             dcc.Tab(label='Summary', children=[
                 # Velocity Profile with Interpolation
                 html.Div([
                     html.H3("Velocity Profile with Lake Surface", 
                            style={'color': theme['text'], 'marginBottom': '8px', 'fontWeight': '600'}),
-                    html.P("Observed layer velocities with spline interpolation from surface to lake",
+                    html.P("Observed layer velocities with linear (Nye) fit from surface to lake",
                           style={'color': theme['muted'], 'fontSize': '14px', 'marginBottom': '16px'}),
-                    dcc.Graph(id='velocity-profile-sea-surface', figure=velocity_profile_fig, style={'height': '600px'}),
+                    dcc.Checklist(
+                        id='summary-show-deep',
+                        options=[
+                            {'label': ' Show deep layers (segment-stitched)', 'value': 'deep'},
+                            {'label': ' Show optimal tracked layers (Viterbi)', 'value': 'optimal'},
+                            {'label': ' Show phase-slope velocity (SVD-denoised)', 'value': 'phase_slope'},
+                        ],
+                        value=['optimal'],
+                        style={'fontSize': '14px', 'marginBottom': '12px', 'color': theme['text']},
+                    ),
+                    dcc.Graph(id='velocity-profile-sea-surface', style={'height': '600px'}),
                 ], style={
                     'margin': '20px 18px 30px 18px',
                     'padding': '24px',
@@ -2398,22 +2876,6 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                     html.P('Sub-wavelength tracking of sea surface using phase unwrapping',
                           style={'color': theme['muted'], 'fontSize': '14px', 'marginBottom': '16px'}),
                     dcc.Graph(id='lake-surface-figure', figure=lake_surface_fig, style={'height': '360px'}),
-                ], style={
-                    'margin': '0 18px 30px 18px',
-                    'padding': '24px',
-                    'backgroundColor': theme['panel'],
-                    'borderRadius': '16px',
-                    'border': f"1px solid {theme['border']}",
-                    'boxShadow': theme['shadow'],
-                }),
-                
-                # Analysis Overview
-                html.Div([
-                    html.H3('Detailed Analysis Overview', 
-                           style={'color': theme['text'], 'marginBottom': '8px', 'fontWeight': '600'}),
-                    html.P('Echogram with detected layers, velocity profile, phase time series, and quality assessment',
-                          style={'color': theme['muted'], 'fontSize': '14px', 'marginBottom': '16px'}),
-                    dcc.Graph(id='summary-figure', figure=summary_fig, style={'height': '900px'}),
                 ], style={
                     'margin': '0 18px 30px 18px',
                     'padding': '24px',
@@ -2507,8 +2969,24 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                                 options=[
                                     {'label': 'Amplitude', 'value': 'amplitude'},
                                     {'label': 'Phase', 'value': 'phase'},
+                                    {'label': 'Phase (detrended)', 'value': 'phase_detrended'},
                                 ],
                                 value='amplitude',
+                                inline=True,
+                                style={'marginTop': '6px'},
+                                inputStyle={'marginRight': '6px', 'marginLeft': '12px'},
+                            ),
+                        ], style={'marginRight': '20px'}),
+                        html.Div([
+                            html.Label('Sub-Band:', style={'fontWeight': '600', 'color': theme['text']}),
+                            dcc.RadioItems(
+                                id='subband-mode-3d',
+                                options=[
+                                    {'label': 'Full', 'value': 'full'},
+                                    {'label': 'Low', 'value': 'low'},
+                                    {'label': 'High', 'value': 'high'},
+                                ],
+                                value='full',
                                 inline=True,
                                 style={'marginTop': '6px'},
                                 inputStyle={'marginRight': '6px', 'marginLeft': '12px'},
@@ -2541,12 +3019,12 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                             ),
                         ], style={'width': '160px'}),
                     ], style={'display': 'flex', 'alignItems': 'flex-start', 'marginBottom': '20px', 'flexWrap': 'wrap', 'gap': '15px'}),
-                    dcc.Graph(id='echogram-3d', figure=initial_3d_fig, style={'height': '700px'}),
+                    dcc.Graph(id='echogram-3d', figure=initial_3d_fig, style={'height': 'calc(100vh - 200px)', 'minHeight': '600px'}),
                 ], style={
-                    'padding': '22px',
+                    'padding': '12px 16px',
                     'backgroundColor': theme['panel'],
                     'borderRadius': '16px',
-                    'margin': '18px',
+                    'margin': '8px',
                     'border': f"1px solid {theme['border']}",
                     'boxShadow': theme['shadow'],
                 }),
@@ -2570,12 +3048,12 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                             inputStyle={'marginRight': '6px', 'marginLeft': '12px'},
                         ),
                     ], style={'marginBottom': '10px'}),
-                    dcc.Graph(id='echogram-3d-phase', figure=initial_3d_phase, style={'height': '650px'}),
+                    dcc.Graph(id='echogram-3d-phase', figure=initial_3d_phase, style={'height': 'calc(100vh - 200px)', 'minHeight': '600px'}),
                 ], style={
-                    'padding': '22px',
+                    'padding': '12px 16px',
                     'backgroundColor': theme['panel'],
                     'borderRadius': '16px',
-                    'margin': '18px',
+                    'margin': '8px',
                     'border': f"1px solid {theme['border']}",
                     'boxShadow': theme['shadow'],
                 }),
@@ -2592,6 +3070,7 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                                 options=[
                                     {'label': 'Amplitude', 'value': 'amplitude'},
                                     {'label': 'Phase', 'value': 'phase'},
+                                    {'label': 'Phase (detrended)', 'value': 'phase_detrended'},
                                     {'label': 'Layer Detection', 'value': 'detection'},
                                 ],
                                 value='amplitude',
@@ -2610,6 +3089,21 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                                     {'label': 'SVD', 'value': 'svd'},
                                 ],
                                 value='original',
+                                inline=True,
+                                style={'marginTop': '6px'},
+                                inputStyle={'marginRight': '6px', 'marginLeft': '12px'},
+                            ),
+                        ], style={'marginRight': '20px'}),
+                        html.Div([
+                            html.Label('Sub-Band:', style={'fontWeight': '600', 'color': theme['text']}),
+                            dcc.RadioItems(
+                                id='subband-mode-2d',
+                                options=[
+                                    {'label': 'Full', 'value': 'full'},
+                                    {'label': 'Low', 'value': 'low'},
+                                    {'label': 'High', 'value': 'high'},
+                                ],
+                                value='full',
                                 inline=True,
                                 style={'marginTop': '6px'},
                                 inputStyle={'marginRight': '6px', 'marginLeft': '12px'},
@@ -2677,12 +3171,12 @@ def create_dash_app(output_dir: str, apres_data_path: str) -> 'Dash':
                         ),
                     ], style={'marginBottom': '15px', 'display': 'none'}),
                     
-                    dcc.Graph(id='echogram-2d', figure=initial_2d_echogram, style={'height': '500px'}),
+                    dcc.Graph(id='echogram-2d', figure=initial_2d_echogram, style={'height': 'calc(100vh - 280px)', 'minHeight': '500px'}),
                 ], style={
-                    'padding': '22px',
+                    'padding': '12px 16px',
                     'backgroundColor': theme['panel'],
                     'borderRadius': '16px',
-                    'margin': '18px',
+                    'margin': '8px',
                     'border': f"1px solid {theme['border']}",
                     'boxShadow': theme['shadow'],
                 }),
@@ -3274,9 +3768,147 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                         ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
                     ], style={'marginBottom': '32px'}),
                     
-                    # Section 7: References
+                    # Section 7: Phase-Slope Velocity Estimation
                     html.Div([
-                        html.H3("7. References", 
+                        html.H3("7. Phase-Slope Velocity Estimation", 
+                               style={'color': theme['accent'], 'marginBottom': '12px', 'borderBottom': f"2px solid {theme['accent']}", 'paddingBottom': '8px'}),
+                        
+                        html.P([
+                            "An alternative to tracking individual layer peaks is to estimate vertical velocity "
+                            "directly from the temporal phase evolution of the complex echogram, without requiring "
+                            "layer identification. This method works at all depths where the signal has sufficient "
+                            "coherence, including the deep ice column where individual layers are difficult to track."
+                        ], style={'color': theme['text'], 'marginBottom': '16px'}),
+
+                        html.H4("7.1 Principle", style={'color': theme['text'], 'marginTop': '16px'}),
+                        dcc.Markdown(r'''
+The complex echogram at each depth bin $z$ and time $t$ is:
+
+$$S(z, t) = A(z, t) \, e^{i\phi(z, t)}$$
+
+A reflector moving vertically at velocity $v$ produces a linear phase trend:
+
+$$\phi(z, t) = \phi_0 + \frac{4\pi}{\lambda_c} v \cdot t$$
+
+where $\lambda_c \approx 0.56$ m is the center wavelength in ice. The velocity is recovered from the temporal phase slope:
+
+$$v = \frac{\lambda_c}{4\pi} \cdot \frac{d\phi}{dt}$$
+
+**Sensitivity**: $\lambda_c / 4\pi \approx 0.045$ m/yr per rad/yr.
+                        ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
+
+                        html.H4("7.2 SVD Denoising of the Complex Image", style={'color': theme['text'], 'marginTop': '16px'}),
+                        html.P([
+                            "Before measuring phase slopes, the complex echogram is denoised using Singular Value "
+                            "Decomposition. This can be applied globally or locally within depth windows:"
+                        ], style={'color': theme['text']}),
+                        dcc.Markdown(r'''
+**Local SVD** (preferred): For a depth window of $N_w$ bins $\times$ $N_t$ times:
+
+$$\mathbf{S}_{window} = \mathbf{U} \boldsymbol{\Sigma} \mathbf{V}^H = \sum_{i=1}^{r} \sigma_i \mathbf{u}_i \mathbf{v}_i^H$$
+
+Keeping $k$ components (typically $k = 3$):
+
+$$\mathbf{S}_k = \sum_{i=1}^{k} \sigma_i \mathbf{u}_i \mathbf{v}_i^H$$
+
+The first component captures the mean profile (common-mode instrument drift), and components 2–$k$ capture coherent layer motion. Without SVD denoising, the velocity profile shows no depth gradient (common-mode drift dominates).
+
+**Global vs. Local SVD**:
+- *Global*: SVD over the entire depth range. Efficient but mixes information across disparate depths.
+- *Local*: SVD within each sliding window. Better separation when the window contains enough bins ($\geq 200$, i.e., $\geq 10$ m).
+
+At 20 m windows (~380 bins): local SVD outperforms global (RMS vs Nye: 0.32 vs 0.34 m/yr in the deep column).
+                        ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
+
+                        html.H4("7.3 Windowed Phase-Slope Estimation", style={'color': theme['text'], 'marginTop': '16px'}),
+                        dcc.Markdown(r'''
+The ice column is divided into overlapping depth windows (width $W$, step $\Delta z$). Within each window:
+
+1. **SVD denoise** the complex sub-image ($k$ components)
+2. For each bin $z_i$ in the window:
+   - Unwrap the temporal phase: $\phi_i(t) = \text{unwrap}(\angle S_k(z_i, t))$
+   - Fit a line: $\phi_i(t) = a_i \cdot t + b_i$ via linear regression
+   - Convert slope to velocity: $v_i = \frac{\lambda_c}{4\pi} \cdot a_i$
+   - Record $R^2_i$ of the fit
+3. Filter by quality: keep only bins with $R^2 > 0.5$
+4. **Median** the valid velocities across the window:
+
+$$v_{window} = \text{median}\{v_i : R^2_i > 0.5\}$$
+
+The median is robust to outliers from wrap errors or noise spikes.
+
+**Optimal parameters** (empirically determined):
+| Parameter | Value |
+|-----------|-------|
+| Window width $W$ | 20 m (~380 bins) |
+| Step $\Delta z$ | 10 m |
+| SVD mode | Local |
+| SVD components $k$ | 3 |
+| $R^2$ threshold | 0.5 |
+                        ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
+
+                        html.H4("7.4 Carrier Phase Residual (λ_c/2 Periodicity)", style={'color': theme['text'], 'marginTop': '16px'}),
+                        dcc.Markdown(r'''
+The spatial phase profile exhibits a quasi-periodic oscillation at $\lambda_c / 2 \approx 28$ cm (~5.3 bins), arising from imperfect removal of the carrier frequency during FMCW demodulation.
+
+This oscillation is **time-invariant** — it is identical across all measurements. Therefore it cancels when computing temporal phase slopes $d\phi/dt$ and has **no effect on velocity estimates**.
+
+For visualization, the periodicity can be removed by detrending:
+
+$$S_{detrended}(z, t) = S(z, t) \cdot e^{-i g z}$$
+
+where $g = \text{median}\left\{\frac{d}{dz}[\text{unwrap}(\angle S(z, t_j))]\right\}$ is the mean spatial phase gradient estimated over a sample of time steps.
+                        ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
+
+                        html.H4("7.5 Results and Validation", style={'color': theme['text'], 'marginTop': '16px'}),
+                        dcc.Markdown(r'''
+**Full ice column** (50–1094 m):
+- 103 valid depth windows, all returning finite velocities
+- RMS residual vs Nye model: **0.21 m/yr**
+- Smooth, monotonically increasing velocity profile
+- Matches tracked-layer velocities where both are available
+
+**Comparison with tracked layers**: The phase-slope method produces a continuous velocity profile without requiring layer identification, making it especially valuable in the deep ice column (>785 m) where traditional tracking fails.
+                        ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
+                    ], style={'marginBottom': '32px'}),
+                    
+                    # Section 8: Viterbi Optimal Layer Tracking
+                    html.Div([
+                        html.H3("8. Viterbi Optimal Layer Tracking", 
+                               style={'color': theme['accent'], 'marginBottom': '12px', 'borderBottom': f"2px solid {theme['accent']}", 'paddingBottom': '8px'}),
+                        
+                        html.P([
+                            "Alongside Windowed Phase-Slope Estimation, Viterbi tracking forms our most robust "
+                            "method for continuous layer phase velocity extraction. It employs a Dynamic Programming "
+                            "global optimization approach to track internal ice layers across the depth-time echogram."
+                        ], style={'color': theme['text'], 'marginBottom': '16px'}),
+
+                        html.H4("8.1 Dynamic Programming Formulation", style={'color': theme['text'], 'marginTop': '16px'}),
+                        dcc.Markdown(r'''
+The layer tracking problem is modeled as finding the optimal path through a depth-time grid that maximizes a global energy function:
+
+$$E_{total} = \sum_{t} \left( E_{amp}(z_t) + E_{phase}(z_t, z_{t-1}) - E_{penalty}(z_t, z_{t-1}) \right)$$
+
+- **Amplitude Energy ($E_{amp}$)**: Rewards paths that follow strong reflectors in the SVD-denoised echogram.
+- **Phase Coherence ($E_{phase}$)**: Rewards paths where the phase jump between consecutive time steps is small, representing continuous physical displacement rather than noise.
+- **Slope Penalty ($E_{penalty}$)**: Penalizes instantaneous velocity jumps that exceed physical bounds, guided by a velocity prior (e.g., the Nye model or the Phase-Slope profile).
+                        ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
+
+                        html.H4("8.2 Robust Phase Unwrapping", style={'color': theme['text'], 'marginTop': '16px'}),
+                        dcc.Markdown(r'''
+Once the optimal depth path $z(t)$ is extracted using the Viterbi algorithm, the phase timeseries is unwrapped to yield displacement. To prevent cycle slips in fading signal regions:
+
+1. **Detrending**: The raw phase is first detrended using the expected cruising velocity (from the prior model), which virtually halts phase wrapping in the residual.
+2. **Coasting**: During temporary amplitude drop-outs (low SNR), the algorithm "coasts" using the expected velocity trend, avoiding artificial phase jumps.
+3. **Retrending**: The expected phase trend is added back after unwrapping to produce the final continuous displacement timeseries.
+
+This yields high-precision velocity estimates even for faint or fading internal layers that traditional peak-tracking algorithms fail to follow.
+                        ''', mathjax=True, style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
+                    ], style={'marginBottom': '32px'}),
+                    
+                    # Section 9: References
+                    html.Div([
+                        html.H3("9. References", 
                                style={'color': theme['accent'], 'marginBottom': '12px', 'borderBottom': f"2px solid {theme['accent']}", 'paddingBottom': '8px'}),
                         dcc.Markdown('''
 - **Brennan, P. V., Lok, L. B., Nicholls, K., & Corr, H. (2014)**. Phase-sensitive FMCW radar system for high-precision Antarctic ice shelf profile monitoring. *IET Radar, Sonar & Navigation*, 8(7), 776-786.
@@ -3286,6 +3918,10 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
 - **Summers, P., Peters, S., Bienert, N., et al. (2021)**. ApRES Processing Methods. *IGARSS 2021*.
 
 - **Stewart, C. L. (2018)**. Ice-ocean interactions beneath the north-western Ross Ice Shelf, Antarctica. PhD Thesis, University of Cambridge.
+
+- **Corr, H. F. J., Jenkins, A., Nicholls, K. W., & Doake, C. S. M. (2002)**. Precise measurement of changes in ice-shelf thickness by phase-sensitive radar to determine basal melt rates. *Geophysical Research Letters*, 29(8).
+
+- **Nye, J. F. (1963)**. Correction factor for accumulation measured by the thickness of the annual layers in an ice sheet. *Journal of Glaciology*, 4(36), 785-788.
                         ''', style={'backgroundColor': theme['bg'], 'padding': '16px', 'borderRadius': '8px', 'border': f"1px solid {theme['border']}"}),
                     ], style={'marginBottom': '32px'}),
                     
@@ -3325,6 +3961,20 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                         ),
                     ], style={'marginBottom': '24px', 'maxWidth': '700px'}),
                     html.Div([
+                        html.Div([
+                            html.Label("Velocity source:",
+                                      style={'fontWeight': '600', 'marginRight': '12px', 'color': theme['text']}),
+                            dcc.RadioItems(
+                                id='interp-velocity-source',
+                                options=[
+                                    {'label': 'Tracked layers', 'value': 'tracked'},
+                                    {'label': 'Phase-slope', 'value': 'phase_slope'},
+                                ],
+                                value='tracked',
+                                inline=True,
+                                inputStyle={'marginRight': '6px', 'marginLeft': '12px'},
+                            ),
+                        ], style={'display': 'inline-flex', 'alignItems': 'center', 'marginRight': '40px'}),
                         html.Div([
                             html.Label("Layers to display:",
                                       style={'fontWeight': '600', 'marginRight': '12px', 'color': theme['text']}),
@@ -3425,11 +4075,16 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                     html.H3("Scenario: Dansgaard-Johnsen Model",
                            style={'color': theme['text'], 'marginBottom': '8px', 'fontWeight': '600'}),
                     html.P([
-                        "The Dansgaard-Johnsen model extends Nye by allowing strain rate to "
-                        "decrease linearly to zero in a basal shear layer of thickness ",
+                        "Proposed by Dansgaard & Johnsen (1969) to interpret ice-core "
+                        "age-depth relationships at Camp Century, Greenland, this model "
+                        "assumes a constant vertical strain rate from the surface down to a "
+                        "'kink height' ",
                         html.Span("h", style={'fontFamily': 'monospace', 'fontWeight': '600'}),
-                        ". Above this layer, strain rate is constant (like Nye). "
-                        "This is particularly relevant over a subglacial lake where basal drag is zero. "
+                        " above the bed, below which strain rate decreases linearly to zero. "
+                        "This captures the transition from uniform longitudinal stretching "
+                        "in the upper ice column to a basal shear zone where deformation "
+                        "concentrates. It is especially relevant over a subglacial lake "
+                        "where basal drag is low or zero. "
                         "Parameters (w\u209b, \u03b5\u0307\u2080, h) are fit automatically.",
                     ], style={'color': theme['muted'], 'fontSize': '14px', 'marginBottom': '16px'}),
                     html.Div([
@@ -3464,13 +4119,18 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                     html.H3("Scenario: Lliboutry Shape-Function Model",
                            style={'color': theme['text'], 'marginBottom': '8px', 'fontWeight': '600'}),
                     html.P([
-                        "The Lliboutry model parameterises the velocity profile with a shape exponent ",
+                        "Lliboutry (1979) introduced a general power-law shape function to "
+                        "describe how vertical velocity varies with depth, motivated by the "
+                        "need to connect the velocity profile to Glen's flow-law rheology. "
+                        "The shape exponent ",
                         html.Span("p", style={'fontFamily': 'monospace', 'fontWeight': '600'}),
-                        " related to Glen's flow law. ",
+                        " controls the curvature of the profile: ",
                         html.Span("p = 1", style={'fontFamily': 'monospace'}),
-                        " gives a linear (Nye) profile, while ",
-                        html.Span("p \u2192 \u221e", style={'fontFamily': 'monospace'}),
-                        " gives plug flow (all deformation at the bed). "
+                        " recovers a linear (Nye) profile with uniform strain rate, while "
+                        "larger values concentrate deformation towards the bed. "
+                        "For Glen's Law with exponent n = 3, theory predicts ",
+                        html.Span("p \u2248 1\u20132", style={'fontFamily': 'monospace'}),
+                        ", so the fitted p is a direct test of ice-rheology consistency. "
                         "Parameters (w\u209b, w_b, p) are fit automatically.",
                     ], style={'color': theme['muted'], 'fontSize': '14px', 'marginBottom': '16px'}),
                     html.Div([
@@ -3508,12 +4168,33 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
             html.P('SiegVent2023 Project - ApRES Internal Layer Velocity Analysis'),
         ], style={'textAlign': 'center', 'marginTop': '30px', 'color': theme['muted']}),
     ], style={
-        'padding': '32px',
-        'maxWidth': '1500px',
+        'padding': '16px 24px',
+        'maxWidth': '100%',
         'margin': 'auto',
         'fontFamily': 'Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif',
         'backgroundColor': theme['bg'],
     })
+
+    # ── Summary velocity profile callback (toggle deep layers) ──
+    @app.callback(
+        Output('velocity-profile-sea-surface', 'figure'),
+        Input('summary-show-deep', 'value'),
+    )
+    def update_summary_velocity_profile(show_deep_val):
+        show_deep = 'deep' in (show_deep_val or [])
+        show_optimal = 'optimal' in (show_deep_val or [])
+        show_phase_slope = 'phase_slope' in (show_deep_val or [])
+        return create_velocity_profile_with_sea_surface(
+            results,
+            sea_surface_depth=SEA_SURFACE_DEPTH,
+            sea_surface_velocity=sea_surface_velocity,
+            sea_surface_r_squared=sea_surface_r_squared,
+            ice_thickness=SEA_SURFACE_DEPTH,
+            deep_layers=deep_layers,
+            show_deep=show_deep,
+            show_optimal=show_optimal,
+            phase_slope=results.get('phase_slope') if show_phase_slope else None,
+        )
 
     @app.callback(
         Output('layer-detail', 'figure'),
@@ -3523,11 +4204,25 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         if layer_idx is None:
             layer_idx = 0
 
+        # ── Optimal layer detail (offset indices >= 20000) ──
+        if layer_idx >= 20000:
+            return _build_optimal_layer_detail(layer_idx - 20000)
+
         # ── Deep layer detail (offset indices >= 10000) ──
         if layer_idx >= 10000:
             return _build_deep_layer_detail(layer_idx - 10000)
 
-        phase_data = results['phase']
+        phase_data = results.get('phase')
+        if not phase_data:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="Phase layer tracking data missing for this dataset or subband.",
+                showarrow=False, xref='paper', yref='paper', x=0.5, y=0.5,
+                font=dict(size=14, color="gray")
+            )
+            fig.update_layout(height=400, template="plotly_white")
+            return fig
+
         velocity_data_local = results['velocity']
 
         depths_local = velocity_data_local['depths'].flatten()
@@ -3681,6 +4376,82 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
 
         tracked_depths = depth + displacement  # depth + displacement in meters
         return time_days_local, tracked_depths
+
+    def _build_optimal_layer_detail(opt_idx):
+        """Build Layer Detail figure for an optimal Viterbi tracked layer."""
+        opt = results.get('optimal')
+        if opt is None or opt.get('layer_depths', np.array([])).size == 0 or opt_idx >= opt.get('layer_depths', np.array([])).size:
+            fig = go.Figure()
+            fig.add_annotation(text='Optimal track data not available', showarrow=False,
+                               xref='paper', yref='paper', x=0.5, y=0.5)
+            return fig
+
+        depth = float(opt['layer_depths'].flatten()[opt_idx])
+        velocity = float(opt['velocities_m_yr'].flatten()[opt_idx])
+        r_sq = float(opt['r_squared'].flatten()[opt_idx]) if 'r_squared' in opt else np.nan
+
+        time_days_local = opt['time_days'].flatten()
+        range_ts = opt['range_timeseries'][opt_idx, :] * 100  # Convert m to cm
+        amp_ts = opt['amplitude_timeseries'][opt_idx, :]
+        amp_db = 10 * np.log10(amp_ts**2 + 1e-30)
+
+        # Fallback empty fit line
+        fit_line = np.full_like(time_days_local, np.nan, dtype=float)
+        valid = ~np.isnan(range_ts)
+        if np.sum(valid) > 10 and not np.isnan(velocity):
+            slope_cm_day = (velocity * 100) / 365.25
+            mean_t = np.nanmean(time_days_local[valid])
+            mean_r = np.nanmean(range_ts[valid])
+            intercept = mean_r - slope_cm_day * mean_t
+            fit_line = slope_cm_day * time_days_local + intercept
+
+        fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=(
+                f'Viterbi Range Change at {depth:.0f}m',
+                f'Viterbi Amplitude at {depth:.0f}m'
+            ),
+        )
+
+        fig.add_trace(
+            go.Scatter(x=time_days_local, y=range_ts, mode='lines', name='Tracked Range',
+                       line=dict(color='#3b82f6', width=2)),
+            row=1, col=1
+        )
+
+        if not np.all(np.isnan(fit_line)):
+            fig.add_trace(
+                go.Scatter(x=time_days_local, y=fit_line, mode='lines',
+                           name=f'Fit: {velocity:.2f} m/yr',
+                           line=dict(color='#e74c3c', width=2, dash='dash')),
+                row=1, col=1
+            )
+
+        fig.add_trace(
+            go.Scatter(x=time_days_local, y=amp_db, mode='lines', name='Amplitude',
+                       line=dict(color='#27ae60', width=1)),
+            row=1, col=2
+        )
+
+        fig.update_xaxes(title='Time (days)', row=1, col=1)
+        fig.update_yaxes(title='ΔRange (cm)', row=1, col=1)
+        fig.update_xaxes(title='Time (days)', row=1, col=2)
+        fig.update_yaxes(title='Amplitude (dB)', row=1, col=2)
+
+        vel_str = f'{velocity:.2f}' if not np.isnan(velocity) else 'N/A'
+        r_sq_str = f'{r_sq:.3f}' if not np.isnan(r_sq) else 'N/A'
+
+        fig.update_layout(
+            title=dict(
+                text=f'Optimal Viterbi Track at {depth:.0f}m: v = {vel_str} m/yr, R² = {r_sq_str}',
+                font=dict(size=14),
+            ),
+            height=350,
+            showlegend=True,
+            legend=dict(x=0.02, y=0.98),
+        )
+
+        return fig
 
     def _build_deep_layer_detail(deep_idx):
         """Build Layer Detail figure for a deep layer using segment-stitched reconstruction."""
@@ -3889,14 +4660,16 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         Input('depth-interval-input', 'value'),
         Input('denoise-toggle', 'value'),
         Input('echogram-3d-color-mode', 'value'),
+        Input('subband-mode-3d', 'value'),
         Input('resolution-3d', 'value'),
     )
-    def update_3d_echogram(highlighted_indices, depth_start, depth_interval, denoise_mode, color_mode, resolution):
+    def update_3d_echogram(highlighted_indices, depth_start, depth_interval, denoise_mode, color_mode, subband, resolution):
         if highlighted_indices is None:
             highlighted_indices = []
-        # Separate deep layer indices (>= 10000) from standard
+        # Separate deep layer indices (>= 10000) and optimal indices (>= 20000) from standard
         std_indices = [i for i in highlighted_indices if i < 10000]
-        deep_indices = [i - 10000 for i in highlighted_indices if i >= 10000]
+        opt_indices = [i - 20000 for i in highlighted_indices if i >= 20000]
+        deep_indices = [i - 10000 for i in highlighted_indices if 10000 <= i < 20000]
         highlighted_indices = std_indices
         # Parse start depth from text input
         try:
@@ -3935,8 +4708,10 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         if initial_depths is not None:
             initial_depths = initial_depths.flatten()
         
+        current_apres_data = get_apres_data(apres_data_path, subband)
+        
         fig = create_3d_echogram_figure(
-            apres_data, 
+            current_apres_data, 
             depths, 
             highlighted_layers=highlighted_indices,
             depth_range=tuple(depth_range),
@@ -3949,6 +4724,7 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
             phase_time=phase_time,
             color_mode=color_mode,
             initial_depths=initial_depths,
+            subband=subband,
         )
 
         # Overlay deep layers with tracked depth path
@@ -3956,10 +4732,10 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         if dl and dl.get('available') and deep_indices:
             tier_colors = {1: '#ef4444', 2: '#f97316', 3: '#d4a574'}
             tier_symbols = {1: '★★★', 2: '★★', 3: '★'}
-            Rcoarse_local = apres_data['Rcoarse']
-            range_img_local = apres_data['range_img']
+            Rcoarse_local = current_apres_data['Rcoarse']
+            range_img_local = current_apres_data['range_img']
             depth_mask_local = (Rcoarse_local >= depth_range[0]) & (Rcoarse_local <= depth_range[1])
-            echo_sel = range_img_local[depth_mask_local, :][::depth_sub, ::time_sub]
+            echo_sel = fetch_zarr_slice(range_img_local, depth_mask_local, depth_sub, time_sub)
             echo_db_local = 10 * np.log10(echo_sel**2 + 1e-30)
             echo_db_local = np.clip(echo_db_local, -25, 50)
             depths_sel_local = Rcoarse_local[depth_mask_local][::depth_sub]
@@ -3974,7 +4750,7 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                 stars = tier_symbols.get(tier, '★')
                 # Use segment-stitched tracking for overlay
                 t_track, d_track = _compute_deep_layer_tracking(di)
-                t_vals = apres_data['time_days'][::time_sub]
+                t_vals = current_apres_data['time_days'][::time_sub]
                 if t_track is not None and d_track is not None and not np.all(np.isnan(d_track)):
                     # Interpolate tracked depths to subsampled time grid
                     d_interp = np.interp(t_vals, t_track, d_track, left=np.nan, right=np.nan)
@@ -4001,6 +4777,49 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                     )
                 )
 
+        # Overlay optimal Viterbi layers with tracked depth path
+        opt = results.get('optimal')
+        if opt and opt_indices:
+            Rcoarse_local = current_apres_data['Rcoarse']
+            range_img_local = current_apres_data['range_img']
+            depth_mask_local = (Rcoarse_local >= depth_range[0]) & (Rcoarse_local <= depth_range[1])
+            echo_sel = fetch_zarr_slice(range_img_local, depth_mask_local, depth_sub, time_sub)
+            echo_db_local = 10 * np.log10(echo_sel**2 + 1e-30)
+            echo_db_local = np.clip(echo_db_local, -25, 50)
+            depths_sel_local = Rcoarse_local[depth_mask_local][::depth_sub]
+            
+            n_opt_layers = opt.get('layer_depths', np.array([])).size
+            for oi in opt_indices:
+                if oi >= n_opt_layers:
+                    continue
+                dd = float(opt['layer_depths'].flatten()[oi])
+                if dd < depth_range[0] or dd > depth_range[1]:
+                    continue
+                
+                clr = '#3b82f6'  # Blue for optimal tracks
+                t_vals = current_apres_data['time_days'][::time_sub]
+                
+                d_track_all = opt['range_timeseries'][oi, :] + dd
+                d_interp = np.interp(t_vals, current_apres_data['time_days'], d_track_all, left=np.nan, right=np.nan)
+                
+                # Look up z-values at tracked depth for each time step
+                z_vals = np.zeros(len(t_vals))
+                for ti in range(len(t_vals)):
+                    d_at_t = d_interp[ti] if not np.isnan(d_interp[ti]) else dd
+                    didx = np.argmin(np.abs(depths_sel_local - d_at_t))
+                    z_vals[ti] = echo_db_local[min(didx, echo_db_local.shape[0]-1), ti]
+                    
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=t_vals, y=d_interp, z=z_vals + 4,
+                        mode='lines',
+                        line=dict(color=clr, width=8),
+                        name=f'OptTrack {dd:.0f}m',
+                        connectgaps=False,
+                        hovertemplate=f'Optimal layer {dd:.0f}m<br>Time: %{{x:.1f}} days<br>Depth: %{{y:.1f}} m<extra></extra>',
+                    )
+                )
+
         return fig
 
     @app.callback(
@@ -4010,13 +4829,16 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         Input('depth-interval-input', 'value'),
         Input('phase-wrap-toggle', 'value'),
         Input('resolution-3d', 'value'),
+        Input('echogram-3d-color-mode', 'value'), # Ignore, trigger layout rebuild
+        Input('subband-mode-3d', 'value'),
     )
-    def update_3d_phase_echogram(highlighted_indices, depth_start, depth_interval, phase_mode, resolution):
+    def update_3d_phase_echogram(highlighted_indices, depth_start, depth_interval, phase_mode, resolution, dummy_color, subband):
         if highlighted_indices is None:
             highlighted_indices = []
         # Separate deep layer indices
         std_indices = [i for i in highlighted_indices if i < 10000]
-        deep_indices_phase = [i - 10000 for i in highlighted_indices if i >= 10000]
+        opt_indices_phase = [i - 20000 for i in highlighted_indices if i >= 20000]
+        deep_indices_phase = [i - 10000 for i in highlighted_indices if 10000 <= i < 20000]
         highlighted_indices = std_indices
         try:
             depth_start = float(depth_start) if depth_start else 50
@@ -4047,8 +4869,10 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         if init_depths is not None:
             init_depths = init_depths.flatten()
 
+        current_apres_data = get_apres_data(apres_data_path, subband)
+        
         fig = create_3d_phase_echogram_figure(
-            apres_data,
+            current_apres_data,
             depths,
             lambdac,
             highlighted_layers=highlighted_indices,
@@ -4068,13 +4892,13 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
             tier_symbols = {1: '★★★', 2: '★★', 3: '★'}
             res_map_p = {'low': (20, 10), 'medium': (10, 5), 'high': (5, 2), 'ultra': (2, 1)}
             ts_p, ds_p = res_map_p.get(resolution or 'medium', (10, 5))
-            Rcoarse_local = apres_data['Rcoarse']
-            range_img_local = apres_data['range_img']
+            Rcoarse_local = current_apres_data['Rcoarse']
+            range_img_local = current_apres_data['range_img']
             depth_mask_local = (Rcoarse_local >= depth_range[0]) & (Rcoarse_local <= depth_range[1])
-            echo_sel = range_img_local[depth_mask_local, :][::ds_p, ::ts_p]
+            echo_sel = fetch_zarr_slice(range_img_local, depth_mask_local, ds_p, ts_p)
             echo_db_local = np.clip(10 * np.log10(echo_sel**2 + 1e-30), -25, 50)
             depths_sel_local = Rcoarse_local[depth_mask_local][::ds_p]
-            t_vals = apres_data['time_days'][::ts_p]
+            t_vals = current_apres_data['time_days'][::ts_p]
             for di in deep_indices_phase:
                 if di >= dl['n_layers']:
                     continue
@@ -4122,10 +4946,11 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         Input('highlight-layers-2d', 'value'),
         Input('phase-mode-2d', 'value'),
         Input('detection-method-2d', 'value'),
+        Input('subband-mode-2d', 'value'),
         Input('resolution-2d', 'value'),
     )
     def update_2d_views(depth_start, depth_interval, view_type, denoise_mode, 
-                        highlighted_indices, phase_mode, detection_method, resolution):
+                        highlighted_indices, phase_mode, detection_method, subband, resolution):
         try:
             depth_start = float(depth_start) if depth_start else 50
             depth_start = max(0, min(2000, depth_start))
@@ -4140,9 +4965,10 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         
         if highlighted_indices is None:
             highlighted_indices = []
-        # Separate deep layer indices
+        # Separate deep layer indices and optimal tracked indices
         std_indices_2d = [i for i in highlighted_indices if i < 10000]
-        deep_indices_2d = [i - 10000 for i in highlighted_indices if i >= 10000]
+        opt_indices_2d = [i - 20000 for i in highlighted_indices if i >= 20000]
+        deep_indices_2d = [i - 10000 for i in highlighted_indices if 10000 <= i < 20000]
         highlighted_indices = std_indices_2d
         
         # Resolution mapping for 2D: (time_step, depth_step)
@@ -4171,10 +4997,12 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         
         view_type = view_type or 'amplitude'
         
+        current_apres_data = get_apres_data(apres_data_path, subband)
+        
         if view_type == 'phase':
             phase_style = {'marginBottom': '15px', 'display': 'flex', 'alignItems': 'center'}
             fig = create_2d_phase_figure(
-                apres_data, 
+                current_apres_data, 
                 depth_range=depth_range,
                 phase_mode=phase_mode or 'wrapped',
                 highlighted_layers=highlighted_indices,
@@ -4184,11 +5012,64 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                 initial_depths=initial_depths,
                 time_step=time_step,
                 depth_step=depth_step,
+                subband=subband,
             )
+        elif view_type == 'phase_detrended':
+            # Phase with λ_c/2 spatial periodicity removed
+            raw_complex = current_apres_data.get('raw_complex')
+            if raw_complex is not None:
+                Rcoarse_2d = current_apres_data['Rcoarse']
+                time_days_2d = current_apres_data['time_days']
+                dm = (Rcoarse_2d >= depth_range[0]) & (Rcoarse_2d <= depth_range[1])
+                phase_det = compute_detrended_phase(raw_complex, Rcoarse_2d, depth_mask=dm)
+                step_2d = time_step if time_step is not None else max(1, len(time_days_2d) // 400)
+                step_2d = max(1, step_2d)
+                ds = max(1, depth_step)
+                fig = go.Figure(
+                    data=go.Heatmap(
+                        x=time_days_2d[::step_2d],
+                        y=Rcoarse_2d[dm][::ds],
+                        z=phase_det[::ds, ::step_2d],
+                        colorscale='Twilight',
+                        zmin=-np.pi,
+                        zmax=np.pi,
+                        colorbar=dict(title='Phase (rad)'),
+                        hovertemplate='Time: %{x:.1f} days<br>Depth: %{y:.1f} m<br>Phase: %{z:.2f} rad<extra></extra>',
+                    )
+                )
+                # Layer overlay
+                if highlighted_indices and velocity_data is not None:
+                    ld = velocity_data['depths'].flatten()
+                    for li in highlighted_indices:
+                        if li >= len(ld):
+                            continue
+                        md = ld[li]
+                        bd = initial_depths[li] if initial_depths is not None and li < len(initial_depths) else md
+                        if range_ts is not None and phase_time is not None:
+                            td = bd + range_ts[li, :]
+                            fig.add_trace(go.Scatter(x=phase_time, y=td, mode='lines',
+                                                     line=dict(color='red', width=2),
+                                                     name=f'Layer {li} ({md:.0f}m)'))
+                fig.update_layout(
+                    title='Phase (2D) — λ_c/2 Detrended',
+                    height=750,
+                    template='plotly_white',
+                    font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
+                    margin=dict(l=40, r=10, t=40, b=40),
+                    showlegend=len(highlighted_indices) > 0 if highlighted_indices else False,
+                    legend=dict(x=1.02, y=1, bgcolor='rgba(255,255,255,0.8)'),
+                )
+                fig.update_yaxes(title='Depth (m)', autorange='reversed')
+                fig.update_xaxes(title='Time (days)')
+            else:
+                fig = go.Figure()
+                fig.add_annotation(text='No complex data available', xref='paper', yref='paper',
+                                   x=0.5, y=0.5, showarrow=False)
+                fig.update_layout(height=500, template='plotly_white')
         elif view_type == 'detection':
             detection_style = {'marginBottom': '15px', 'display': 'block'}
             fig = create_2d_detection_overlay_figure(
-                apres_data, 
+                current_apres_data, 
                 depth_range=depth_range,
                 method=detection_method or 'gradient',
                 denoise=denoise,
@@ -4201,11 +5082,12 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                 initial_depths=initial_depths,
                 time_step=time_step,
                 depth_step=depth_step,
+                subband=subband,
             )
         else:
             # Default: amplitude
             fig = create_2d_echogram_figure(
-                apres_data, 
+                current_apres_data, 
                 depth_range=depth_range,
                 denoise=denoise,
                 denoise_method=denoise_method,
@@ -4217,6 +5099,7 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                 initial_depths=initial_depths,
                 time_step=time_step,
                 depth_step=depth_step,
+                subband=subband,
             )
         
         # Overlay deep layers on 2D echogram (tracked path, not constant line)
@@ -4256,6 +5139,33 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                         annotation_position='right',
                         annotation_font=dict(color=clr, size=10),
                     )
+
+        # Overlay optimal Viterbi layers on 2D echogram
+        opt = results.get('optimal')
+        if opt and opt_indices_2d:
+            clr = '#3b82f6'  # Blue for optimal tracks
+            n_opt_layers = opt.get('layer_depths', np.array([])).size
+            for oi in opt_indices_2d:
+                if oi >= n_opt_layers:
+                    continue
+                dd = float(opt['layer_depths'].flatten()[oi])
+                if dd < depth_range[0] or dd > depth_range[1]:
+                    continue
+                
+                t_track = apres_data['time_days']
+                d_track_all = opt['range_timeseries'][oi, :] + dd
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=t_track[::time_step],
+                        y=d_track_all[::time_step],
+                        mode='lines',
+                        line=dict(color=clr, width=2.5),
+                        name=f'OptTrack {dd:.0f}m',
+                        connectgaps=False,
+                        hovertemplate='Time: %{x:.1f} days<br>Tracked depth: %{y:.2f} m<extra></extra>',
+                    )
+                )
 
         return fig, phase_style, detection_style
 
@@ -4730,8 +5640,9 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         Input('interp-layer-filter', 'value'),
         Input('interp-depth-range', 'value'),
         Input('interp-exaggeration', 'value'),
+        Input('interp-velocity-source', 'value'),
     )
-    def update_slope_interpretation(u_h, layer_filter, depth_range, exag):
+    def update_slope_interpretation(u_h, layer_filter, depth_range, exag, vel_source):
         if u_h is None:
             u_h = 226.0
         u_h = float(u_h)
@@ -4743,18 +5654,38 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         if exag is None:
             exag = 1
         exag = float(exag)
+        vel_source = vel_source or 'tracked'
 
-        velocity_data_local = results['velocity']
-        depths_local = velocity_data_local['depths'].flatten()
-        vel_local = velocity_data_local['velocities'].flatten()
-        r_sq_local = velocity_data_local['r_squared'].flatten()
-        rel_local = velocity_data_local['reliable'].flatten().astype(bool)
-        vel_smooth = velocity_data_local['velocities_smooth'].flatten()
+        # Choose velocity source
+        ps_data = results.get('phase_slope')
+        use_phase_slope = vel_source == 'phase_slope' and ps_data is not None
 
-        # Load uncertainties if available
-        has_unc = 'uncertainty_kingslake' in velocity_data_local
+        if use_phase_slope:
+            ps_depths = np.array(ps_data['depths'])
+            ps_vel = np.array(ps_data['phase_slope_velocities'])
+            ps_r2 = np.array(ps_data.get('phase_slope_r2', [0.5] * len(ps_depths)))
+            ps_valid = np.isfinite(ps_vel)
+            depths_local = ps_depths[ps_valid]
+            vel_local = ps_vel[ps_valid]
+            r_sq_local = ps_r2[ps_valid] if len(ps_r2) == len(ps_depths) else np.full(ps_valid.sum(), 0.5)
+            rel_local = r_sq_local >= 0.3
+            # Smoothed trend via simple moving average
+            from scipy.ndimage import uniform_filter1d
+            vel_smooth = uniform_filter1d(vel_local, size=min(5, len(vel_local)))
+            source_label = f'Phase-slope ({ps_data.get("svd_mode", "local")} SVD k={ps_data.get("svd_components", 3)}, {ps_data.get("window_m", 20):.0f}m)'
+        else:
+            velocity_data_local = results['velocity']
+            depths_local = velocity_data_local['depths'].flatten()
+            vel_local = velocity_data_local['velocities'].flatten()
+            r_sq_local = velocity_data_local['r_squared'].flatten()
+            rel_local = velocity_data_local['reliable'].flatten().astype(bool)
+            vel_smooth = velocity_data_local['velocities_smooth'].flatten()
+            source_label = 'Tracked layers'
+
+        # Load uncertainties if available (tracked only)
+        has_unc = not use_phase_slope and 'uncertainty_kingslake' in results.get('velocity', {})
         if has_unc:
-            unc = velocity_data_local['uncertainty_kingslake'].flatten()
+            unc = results['velocity']['uncertainty_kingslake'].flatten()
 
         # Calculate implied slopes: θ = arctan(w / u_h)
         slopes_deg = np.degrees(np.arctan(vel_local / u_h))
@@ -4767,15 +5698,14 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         else:
             bed_slope_deg = np.nan
 
-        # Build figure: 3 panels
+        # Build figure: 2 panels
         fig = make_subplots(
-            rows=1, cols=3,
+            rows=1, cols=2,
             subplot_titles=(
                 "Implied Layer Slopes",
                 "Ice Column Cross-Section",
-                "Slope vs Measured Velocity",
             ),
-            column_widths=[0.35, 0.35, 0.30],
+            column_widths=[0.45, 0.55],
             horizontal_spacing=0.08,
         )
 
@@ -4798,7 +5728,7 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                 colorscale='Viridis',
                 size=9,
                 cmin=0.3, cmax=1.0,
-                colorbar=dict(title='R²', x=0.30, len=0.5, y=0.5),
+                colorbar=dict(title='R²', x=0.40, len=0.5, y=0.5),
                 line=dict(color='white', width=0.5),
             ),
             name='Reliable layers',
@@ -4994,51 +5924,24 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
             row=1, col=2,
         )
 
-        # ─── Panel 3: Slope vs measured velocity ──────────────────
-        fig.add_trace(go.Scatter(
-            x=vel_local[rel_local], y=slopes_deg[rel_local],
-            mode='markers',
-            marker=dict(
-                color=depths_local[rel_local],
-                colorscale='Viridis',
-                size=8,
-                colorbar=dict(title='Depth (m)', x=1.0, len=0.5, y=0.5),
-                line=dict(color='white', width=0.5),
-            ),
-            name='Layers',
-            showlegend=False,
-            hovertemplate='Velocity: %{x:.3f} m/yr<br>Slope: %{y:.4f}°<br>Depth: %{marker.color:.0f} m<extra></extra>',
-        ), row=1, col=3)
-
-        # Theoretical line: slope = arctan(v / u_h)
-        v_range = np.linspace(
-            min(0, float(np.nanmin(vel_local[rel_local])) - 0.05),
-            float(np.nanmax(vel_local[rel_local])) + 0.05,
-            100,
-        )
-        theory_slope = np.degrees(np.arctan(v_range / u_h))
-        fig.add_trace(go.Scatter(
-            x=v_range, y=theory_slope,
-            mode='lines',
-            line=dict(color='#94a3b8', width=1, dash='dash'),
-            name=f'θ = arctan(v / {u_h:.0f})',
-            showlegend=False,
-            hoverinfo='skip',
-        ), row=1, col=3)
-
-        fig.add_hline(y=0, line=dict(color='#94a3b8', dash='dot', width=1), row=1, col=3)
-
-        fig.update_xaxes(title='Measured vertical velocity (m/yr)', row=1, col=3)
-        fig.update_yaxes(title='Implied slope (degrees)', row=1, col=3)
-
         # ─── Layout ──────────────────────────────────────────────
         # Summary stats annotation
         rel_slopes_deg = slopes_deg[rel_local]
+        if rel_slopes_deg.size > 0:
+            min_slope = f"{np.nanmin(rel_slopes_deg):.3f}°"
+            max_slope = f"{np.nanmax(rel_slopes_deg):.3f}°"
+            med_slope = f"{np.nanmedian(rel_slopes_deg):.3f}°"
+        else:
+            min_slope = "N/A"
+            max_slope = "N/A"
+            med_slope = "N/A"
+            
         stats_text = (
             f"<b>Scenario: uniform u<sub>h</sub> = {u_h:.0f} m/yr</b><br>"
+            f"Source: {source_label}<br>"
             f"Layers: {int(np.sum(rel_local))} reliable<br>"
-            f"Slope range: {np.nanmin(rel_slopes_deg):.3f}° to {np.nanmax(rel_slopes_deg):.3f}°<br>"
-            f"Median slope: {np.nanmedian(rel_slopes_deg):.3f}°<br>"
+            f"Slope range: {min_slope} to {max_slope}<br>"
+            f"Median slope: {med_slope}<br>"
         )
         if not np.isnan(bed_slope_deg):
             stats_text += f"Bed slope: {bed_slope_deg:.3f}°"
@@ -5059,11 +5962,14 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         fig.update_layout(
             height=750,
             showlegend=True,
-            legend=dict(x=0.01, y=0.15, bgcolor='rgba(255,255,255,0.9)',
-                       bordercolor='#e2e8f0', borderwidth=1),
+            legend=dict(
+                orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                bgcolor='rgba(255,255,255,0.9)',
+                bordercolor='#e2e8f0', borderwidth=1,
+            ),
             template='plotly_white',
             font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
-            margin=dict(l=60, r=60, t=60, b=50),
+            margin=dict(l=60, r=60, t=60, b=80),
             title=dict(
                 text=f'Layer Slope Interpretation — assuming u<sub>h</sub> = {u_h:.0f} m/yr',
                 font=dict(size=15),
@@ -5205,6 +6111,26 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                 hovertemplate='Depth: %{y:.0f} m<br>w: %{x:.3f} m/yr<extra>Deep layer</extra>',
             ), row=1, col=1)
 
+        # Phase-slope velocity profile
+        ps_data = results.get('phase_slope')
+        if ps_data is not None:
+            ps_depths = np.array(ps_data['depths'])
+            ps_vel = np.array(ps_data['phase_slope_velocities'])
+            ps_valid = np.isfinite(ps_vel)
+            if ps_valid.any():
+                svd_label = ps_data.get('svd_mode', 'local')
+                k_label = ps_data.get('svd_components', 3)
+                win_label = ps_data.get('window_m', 20)
+                fig.add_trace(go.Scatter(
+                    x=ps_vel[ps_valid], y=ps_depths[ps_valid],
+                    mode='markers+lines',
+                    marker=dict(color='#2ca25f', size=7, symbol='hexagon2',
+                                line=dict(color='white', width=0.5)),
+                    line=dict(color='#2ca25f', width=1.5, dash='dot'),
+                    name=f'Phase-slope ({svd_label} SVD k={k_label}, {win_label:.0f}m)',
+                    hovertemplate='Depth: %{y:.0f} m<br>w: %{x:.4f} m/yr<extra>Phase-slope</extra>',
+                ), row=1, col=1)
+
         # Nye model line
         fig.add_trace(go.Scatter(
             x=w_model, y=z_model,
@@ -5270,6 +6196,24 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
                 showlegend=False,
                 hovertemplate='Depth: %{y:.0f} m<br>Residual: %{x:.4f} m/yr<extra>Deep</extra>',
             ), row=1, col=2)
+
+        # Phase-slope residuals
+        if ps_data is not None:
+            ps_depths_r = np.array(ps_data['depths'])
+            ps_vel_r = np.array(ps_data['phase_slope_velocities'])
+            ps_valid_r = np.isfinite(ps_vel_r)
+            if ps_valid_r.any():
+                ps_predicted = w_surface + strain_rate_zz * ps_depths_r[ps_valid_r]
+                ps_residuals = ps_vel_r[ps_valid_r] - ps_predicted
+                fig.add_trace(go.Scatter(
+                    x=ps_residuals, y=ps_depths_r[ps_valid_r],
+                    mode='markers',
+                    marker=dict(color='#2ca25f', size=6, symbol='hexagon2',
+                                line=dict(color='white', width=0.5)),
+                    name='Residual (phase-slope)',
+                    showlegend=False,
+                    hovertemplate='Depth: %{y:.0f} m<br>Residual: %{x:.4f} m/yr<extra>Phase-slope</extra>',
+                ), row=1, col=2)
 
         # Zero line
         fig.add_vline(x=0, line=dict(color='#f59e0b', dash='dash', width=2), row=1, col=2)
@@ -5354,11 +6298,14 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         fig.update_layout(
             height=650,
             showlegend=True,
-            legend=dict(x=0.01, y=0.15, bgcolor='rgba(255,255,255,0.9)',
-                       bordercolor='#e2e8f0', borderwidth=1),
+            legend=dict(
+                orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                bgcolor='rgba(255,255,255,0.9)',
+                bordercolor='#e2e8f0', borderwidth=1,
+            ),
             template='plotly_white',
             font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
-            margin=dict(l=60, r=60, t=60, b=50),
+            margin=dict(l=60, r=60, t=60, b=80),
             title=dict(
                 text='Nye Model: Incompressibility-derived Vertical Strain Rate',
                 font=dict(size=15),
@@ -5650,11 +6597,14 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         fig.update_layout(
             height=650,
             showlegend=True,
-            legend=dict(x=0.01, y=0.15, bgcolor='rgba(255,255,255,0.9)',
-                       bordercolor='#e2e8f0', borderwidth=1),
+            legend=dict(
+                orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                bgcolor='rgba(255,255,255,0.9)',
+                bordercolor='#e2e8f0', borderwidth=1,
+            ),
             template='plotly_white',
             font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
-            margin=dict(l=60, r=60, t=60, b=50),
+            margin=dict(l=60, r=60, t=60, b=80),
             title=dict(text='Dansgaard-Johnsen Model', font=dict(size=15)),
         )
 
@@ -5954,11 +6904,14 @@ with the deepest detection at 1082.3 m — only 12 m above the ice–lake interf
         fig.update_layout(
             height=650,
             showlegend=True,
-            legend=dict(x=0.01, y=0.15, bgcolor='rgba(255,255,255,0.9)',
-                       bordercolor='#e2e8f0', borderwidth=1),
+            legend=dict(
+                orientation='h', yanchor='top', y=-0.12, xanchor='center', x=0.5,
+                bgcolor='rgba(255,255,255,0.9)',
+                bordercolor='#e2e8f0', borderwidth=1,
+            ),
             template='plotly_white',
             font=dict(family='Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif'),
-            margin=dict(l=60, r=60, t=60, b=50),
+            margin=dict(l=60, r=60, t=60, b=80),
             title=dict(text='Lliboutry Shape-Function Model', font=dict(size=15)),
         )
 
@@ -6048,12 +7001,12 @@ def main():
     
     parser = argparse.ArgumentParser(description='ApRES Layer Analysis Visualization')
     parser.add_argument('--output-dir', type=str, 
-                        default='../../data/apres/layer_analysis',
+                        default='output/apres/hybrid',
                         help='Directory with analysis results')
     parser.add_argument('--data', type=str,
-                        default='../../data/apres/ImageP2_python.mat',
+                        default='data/apres/ImageP2_python.mat',
                         help='Path to ApRES data file')
-    parser.add_argument('--port', type=int, default=8050,
+    parser.add_argument('--port', type=int, default=8051,
                         help='Port for Dash server')
     parser.add_argument('--static', action='store_true',
                         help='Generate static HTML instead of running server')

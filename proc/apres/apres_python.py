@@ -316,7 +316,8 @@ def fmcw_range(
     data: ApRESData,
     pad_factor: int = 2,
     max_range: float = 2000,
-    window_func: Callable = np.blackman
+    window_func: Callable = np.blackman,
+    subband: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Process FMCW radar data to obtain range profile.
@@ -328,6 +329,7 @@ def fmcw_range(
         pad_factor: Zero-padding factor for FFT
         max_range: Maximum range to compute (m)
         window_func: Window function (default: Blackman)
+        subband: None for full, 'low' for first half, 'high' for second half
     
     Returns:
         Rcoarse: Coarse range vector (m)
@@ -341,12 +343,24 @@ def fmcw_range(
     # Calculate number of FFT points
     nfft = n_samples * pad_factor
     
-    # Generate window
-    win = window_func(n_samples)
-    win_rms = np.sqrt(np.mean(win**2))  # RMS of window for scaling
+    # Generate window based on subband selection
+    if subband == 'low':
+        half_n = n_samples // 2
+        half_win = window_func(half_n)
+        win = np.zeros(n_samples, dtype=float)
+        win[:half_n] = half_win
+    elif subband == 'high':
+        half_n = n_samples // 2
+        half_win = window_func(half_n)
+        win = np.zeros(n_samples, dtype=float)
+        win[-half_n:] = half_win
+    else:
+        win = window_func(n_samples)
+        
+    win_rms = np.sqrt(np.mean(win**2)) if np.mean(win**2) > 0 else 1.0  # RMS of window for scaling
     
     # Phase center offset - shift signal so phase center is at t=0
-    # This is critical for correct phase extraction (see MATLAB fmcw_range.m line 79)
+    # For subbands, we still shift by n_samples//2 so the Rcoarse alignment is exactly the same
     xn = n_samples // 2
     
     # Extract parameters
@@ -425,7 +439,8 @@ def process_apres_file(
     filename: str,
     er: float = 3.18,
     max_range: float = 2000,
-    pad_factor: int = 2
+    pad_factor: int = 2,
+    subband: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, ApRESData]:
     """
     High-level function to process a single ApRES file.
@@ -435,6 +450,7 @@ def process_apres_file(
         er: Relative permittivity (default 3.18 for ice)
         max_range: Maximum range to compute (m)
         pad_factor: FFT zero-padding factor
+        subband: Optional subband extraction ('low' or 'high')
     
     Returns:
         Rcoarse: Range vector (m)
@@ -442,7 +458,7 @@ def process_apres_file(
         data: Full ApRESData object
     """
     data = fmcw_load(filename, er)
-    Rcoarse, Rfine, spec_cor, spec = fmcw_range(data, pad_factor, max_range)
+    Rcoarse, Rfine, spec_cor, spec = fmcw_range(data, pad_factor, max_range, subband=subband)
     
     # Average across all subbursts
     spec_avg = np.mean(np.abs(spec_cor), axis=0)
@@ -458,6 +474,7 @@ def process_timeseries(
     verbose: bool = True,
     step: int = 1,
     keep_complex: bool = False,
+    subband: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list]:
     """
     Process all ApRES files in a folder to create a time series.
@@ -473,6 +490,8 @@ def process_timeseries(
                    pad_factor=8 gives ~0.05m bins vs ~0.21m for pad_factor=2
         verbose: Print progress
         step: Process every Nth file (default 1 = all files)
+        keep_complex: Whether to keep complex array
+        subband: 'low' or 'high' or None for processing sub-bands
     
     Returns:
         range_img: 2D array of range profiles [n_bins, n_files]
@@ -495,7 +514,7 @@ def process_timeseries(
     
     # Process first file to get dimensions
     data = fmcw_load(str(files[0]), er)
-    Rcoarse, Rfine, spec_cor, spec = fmcw_range(data, pad_factor, max_range)
+    Rcoarse, Rfine, spec_cor, spec = fmcw_range(data, pad_factor, max_range, subband=subband)
     n_bins = len(Rcoarse)
     n_files = len(files)
     
@@ -516,7 +535,7 @@ def process_timeseries(
         
         try:
             data = fmcw_load(str(filepath), er)
-            Rcoarse, Rfine, spec_cor, spec = fmcw_range(data, pad_factor, max_range)
+            Rcoarse, Rfine, spec_cor, spec = fmcw_range(data, pad_factor, max_range, subband=subband)
             range_img[:, i] = np.mean(np.abs(spec_cor), axis=0)
             rfine_avg[:, i] = np.mean(Rfine, axis=0)
             if keep_complex:

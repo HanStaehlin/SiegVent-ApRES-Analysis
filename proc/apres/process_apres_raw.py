@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 from scipy.io import savemat
+import zarr
 
 from apres_python import process_timeseries
 
@@ -36,6 +37,18 @@ def main() -> None:
         action="store_true",
         help="Do not store complex RawImage (magnitude only)",
     )
+    parser.add_argument(
+        "--subband",
+        type=str,
+        default=None,
+        choices=["low", "high"],
+        help="Subband to process (low, high, or omitted for full band)",
+    )
+    parser.add_argument(
+        "--zarr",
+        action="store_true",
+        help="Also export outputs as chunked Zarr arrays for efficient web loading."
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output)
@@ -50,6 +63,7 @@ def main() -> None:
         pad_factor=args.pad_factor,
         step=args.step,
         keep_complex=keep_complex,
+        subband=args.subband,
     )
 
     if keep_complex:
@@ -58,17 +72,44 @@ def main() -> None:
         range_img, rfine_avg, rcoarse, time_days, timestamps = result
         range_img_complex = None
 
+    lambdac = 1.0 / np.sqrt(args.er)
+    
     mat_dict = {
         "RawImage": range_img,
         "RfineBarTime": rfine_avg,
         "Rcoarse": rcoarse,
         "TimeInDays": time_days,
+        "lambdac": lambdac,
     }
     if range_img_complex is not None:
         mat_dict["RawImageComplex"] = range_img_complex
 
     savemat(str(output_path), mat_dict)
     print(f"Saved: {output_path}")
+
+    if args.zarr:
+        zarr_path = output_path.with_suffix(".zarr")
+        print(f"Creating Zarr store at: {zarr_path}")
+        store = zarr.DirectoryStore(str(zarr_path))
+        root = zarr.group(store=store, overwrite=True)
+        
+        root.array('Rcoarse', rcoarse.astype(np.float32), dtype='float32')
+        root.array('time_days', time_days.astype(np.float32), dtype='float32')
+        root.attrs['lambdac'] = lambdac
+        
+        chunk_depth, chunk_time = 500, 100
+        cd = min(chunk_depth, range_img.shape[0])
+        ct = min(chunk_time, range_img.shape[1])
+        z_img = root.zeros('range_img', shape=range_img.shape, chunks=(cd, ct), dtype='float32')
+        z_img[:] = range_img.astype(np.float32)
+        
+        if range_img_complex is not None:
+            cd = min(chunk_depth, range_img_complex.shape[0])
+            ct = min(chunk_time, range_img_complex.shape[1])
+            z_comp = root.zeros('raw_complex', shape=range_img_complex.shape, chunks=(cd, ct), dtype='complex64')
+            z_comp[:] = range_img_complex.astype(np.complex64)
+            
+        print(f"Saved Zarr: {zarr_path}")
 
 
 if __name__ == "__main__":
